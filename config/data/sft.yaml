@@ -1,0 +1,2 @@
+path: ???           # Override at CLI: data.path=/path/to/prepared_sft_data
+target_only: true   # SFT: loss only on response tokens

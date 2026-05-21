@@ -156,6 +156,42 @@ python -m conversion.convert_to_hf \
 
 For evaluation and export, EMA weights are used by default when EMA is present in the checkpoint.
 
+## Fine-Tuning (SFT)
+
+Continue-train a pretrain checkpoint on instruction data. Full-parameter only.
+
+Input is a JSONL with one object per line; `condition` defaults to `direct`:
+
+```json
+{"instruction": "<full prompt>", "response": "<expected output>", "condition": "direct"}
+```
+
+### 1. Prepare Data
+
+```bash
+python scripts/prepare_sft_data.py \
+  --train your.jsonl \
+  --tokenizer /path/to/tokenizer.json \
+  --output /dev/shm/sft_data \
+  --epochs <N>
+```
+
+`--epochs` must equal the training epochs (one pre-shuffle per epoch).
+
+### 2. Launch Training
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+torchrun --nproc_per_node=8 pretrain.py \
+  --config-name cfg_sft \
+  arch/size@arch=XL \
+  data.path=/dev/shm/sft_data \
+  resume_from=/path/to/pretrain_ckpt \
+  +checkpoint_path=/path/to/sft_out
+```
+
+`resume_from` loads both model weights and optimizer state (including EMA) by default. Add `weights_only_resume_from_ema=true` to swap the pretrain EMA buffer into the model and start with a fresh optimizer — typical when fine-tuning off a pretrain run. The `arch/*` flags must match the pretrain checkpoint's `all_config.yaml` (override `arch.n_layers` etc. if it differs from the size preset).
+
 ## Status
 
 - Training, checkpointing, and evaluation are implemented in this repository.

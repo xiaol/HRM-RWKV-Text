@@ -91,7 +91,10 @@ class HierarchicalReasoningModel(nn.Module):
         return None, z_H
 
     def compute_train_extra_args(self, train_state: Any) -> dict[str, Any]:
-        return dict(bp_steps=self.bp_min_steps + int(min(1, train_state.step / (train_state.total_steps * self.bp_warmup_ratio)) * (self.bp_max_steps - self.bp_min_steps)))
+        warmup_steps = train_state.total_steps * self.bp_warmup_ratio
+        progress = min(1.0, train_state.step / warmup_steps) if warmup_steps > 0 else 1.0
+
+        return dict(bp_steps=self.bp_min_steps + int(progress * (self.bp_max_steps - self.bp_min_steps)))
 
     def initial_carry(self, batch_size: int, dtype: torch.dtype) -> None:
         return None

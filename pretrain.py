@@ -1,6 +1,7 @@
 from typing import Optional
 from dataclasses import dataclass
 from pathlib import Path
+from glob import glob
 import math
 import os
 import yaml
@@ -9,7 +10,7 @@ import shutil
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict, set_optimizer_state_dict
 from torch.distributed.fsdp import fully_shard, FSDPModule, MixedPrecisionPolicy
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
@@ -66,6 +67,11 @@ class PretrainConfig(pydantic.BaseModel):
     project_name: Optional[str] = None
     run_name: Optional[str] = None
     checkpoint_path: Optional[str] = None
+
+    # Resume / fine-tune from checkpoint
+    resume_from: Optional[str] = None
+    resume_epoch: Optional[int] = None
+    weights_only_resume_from_ema: bool = False  # Swap EMA into model + reset optim
 
     # Extras
     seed: int = 0
@@ -218,6 +224,49 @@ def reduce_metrics(local_metrics: dict[str, Tensor], prefix: str):
     return {prefix + name: metrics[idx] for idx, name in enumerate(metric_keys)}
 
 
+def load_checkpoint(config: PretrainConfig, train_state: TrainState):
+    """Resume from a saved checkpoint.
+
+    Loads both model weights and optimizer state (which carries EMA in
+    AdamATan2). When weights_only_resume_from_ema=True, swaps the EMA buffer
+    into the model and resets the optimizer state — typical for fine-tuning
+    off a pretrain run with EMA-smoothed weights.
+    """
+    if config.resume_from is None:
+        return
+
+    epoch = config.resume_epoch
+    if epoch is None:
+        ckpt_files = glob(os.path.join(config.resume_from, "fsdp2_epoch_*"))
+        if not ckpt_files:
+            raise FileNotFoundError(f"No checkpoint found in {config.resume_from}")
+        epoch = max(int(Path(f).stem.split("_")[-1]) for f in ckpt_files)
+
+    checkpoint_id = os.path.join(config.resume_from, f"fsdp2_epoch_{epoch}")
+    print(f"[Resume] Loading model + optimizer from {checkpoint_id}")
+    optim_state = get_optimizer_state_dict(train_state.model, train_state.optim)
+    dcp.load(
+        {"model": train_state.model.state_dict(), "optim": optim_state},
+        checkpoint_id=checkpoint_id,
+    )
+    set_optimizer_state_dict(train_state.model, train_state.optim, optim_state)
+
+    # set_optimizer_state_dict silently overwrites param_groups with the pretrain hyperparams
+    # (lr, betas, weight_decay, ema). Restore the SFT cfg values so that overrides take effect.
+    # (lr is also restored every step by update_lr() — these three are not.)
+    for param_group in train_state.optim.param_groups:
+        param_group["betas"] = (config.beta1, config.beta2)
+        param_group["weight_decay"] = config.weight_decay
+        param_group["ema"] = config.ema
+
+    if config.weights_only_resume_from_ema:
+        print("[Resume] Swapping EMA into model and resetting optimizer state")
+        train_state.optim.swap_ema()
+        train_state.optim._init_state()
+
+    print(f"[Resume] Done.")
+
+
 def save_code_and_config(config: PretrainConfig, train_metadata: V1DatasetMeta):
     if config.checkpoint_path is None or wandb.run is None:
         return
@@ -288,6 +337,7 @@ def launch(hydra_config: DictConfig):
 
     # --- Training
     train_state, train_loader, train_metadata = init_train(config, rank=RANK, world_size=WORLD_SIZE)
+    load_checkpoint(config, train_state)
 
     # Progress bar and logger
     progress_bar = None
