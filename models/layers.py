@@ -8,7 +8,11 @@ from einops import rearrange
 
 from models.common import trunc_normal_init_, unwrap_tensor
 from models.flash_attention_prefixlm_v2 import flash_attn_varlen_prefixlm
-from flash_attn_interface import flash_attn_with_kvcache
+try:
+    from flash_attn_interface import flash_attn_with_kvcache
+except ModuleNotFoundError:
+    def flash_attn_with_kvcache(*args, **kwargs):
+        raise RuntimeError("flash_attn_3 is required for KV-cache inference.")
 
 
 Carry = dict[str, Any]
@@ -140,7 +144,12 @@ class Attention(nn.Module):
             key = apply_rotary_pos_emb(key, cos_sin)
 
         is_causal = self.attn_type == "causal"
-        if cache is None:
+        if cache is None and "prefix_lens" not in seq_info:
+            q = query.transpose(-3, -2)
+            k = key.transpose(-3, -2)
+            v = value.transpose(-3, -2)
+            attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(-3, -2)
+        elif cache is None:
             # flash attn (training)
             attn_output = flash_attn_varlen_prefixlm(query, key, value, is_causal, **{name: unwrap_tensor(tensor) for name, tensor in seq_info.items()})
         else:

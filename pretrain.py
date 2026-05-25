@@ -212,6 +212,16 @@ def train_batch(train_state: TrainState, batch: dict[str, Tensor], **kwargs):
     return metrics
 
 
+def move_batch_to_device(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
+    moved = {}
+    for k, v in batch.items():
+        if isinstance(v, Tensor):
+            moved[k] = v.to(device, non_blocking=True)
+        else:
+            moved[k] = v
+    return moved
+
+
 @torch.inference_mode()
 def reduce_metrics(local_metrics: dict[str, Tensor], prefix: str):
     metric_keys = list(sorted(local_metrics.keys()))  # Sort keys to guarantee all processes use the same order.
@@ -329,6 +339,8 @@ def launch(hydra_config: DictConfig):
 
         torch.cuda.set_device(DEVICE_ID)
 
+    device = torch.device("cuda", DEVICE_ID)
+
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK)
 
@@ -356,6 +368,7 @@ def launch(hydra_config: DictConfig):
         # ############ Train Iter
         train_state.model.train()
         for batch, batch_info in train_loader:
+            batch = move_batch_to_device(batch, device)
             train_state.step += 1            
             lr = update_lr(config, train_state)
             # Extra train arguments (such as BP warmup etc.)

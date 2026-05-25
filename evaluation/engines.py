@@ -2,8 +2,6 @@ from typing import Optional
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
 
-from simple_inference_engine import inference_load_checkpoint, inference_generate
-
 class BaseEngine:
     def generate(self, prompts: list[str]) -> list[str]:
         raise NotImplementedError
@@ -22,9 +20,13 @@ class VLLMEngine(BaseEngine):
 
 class SimpleEngine(BaseEngine):
     def __init__(self, ckpt_path: str, ckpt_epoch: Optional[int] = None, ckpt_use_ema: bool = True):
+        from simple_inference_engine import inference_load_checkpoint
+
         self.ckpt = inference_load_checkpoint(ckpt_path, ckpt_epoch, ckpt_use_ema)
 
     def generate(self, prompts: list[str], batch_size: int = 100, max_context: int = 1024, max_tokens: Optional[int] = None, temperature: float = 0.0, condition: str = "direct") -> list[str]:
+        from simple_inference_engine import inference_generate
+
         if max_tokens is None:
             max_tokens = max_context
 

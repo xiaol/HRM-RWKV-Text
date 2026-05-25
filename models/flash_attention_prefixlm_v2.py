@@ -4,7 +4,17 @@ import torch
 from torch import Tensor
 import numpy as np
 
-from flash_attn_interface import _flash_attn_backward, maybe_contiguous
+try:
+    from flash_attn_interface import _flash_attn_backward, maybe_contiguous
+    _HAS_FLASH_ATTN_3 = True
+except ModuleNotFoundError:
+    _HAS_FLASH_ATTN_3 = False
+
+    def maybe_contiguous(x):
+        return x.contiguous() if x is not None and not x.is_contiguous() else x
+
+    def _flash_attn_backward(*args, **kwargs):
+        raise RuntimeError("flash_attn_3 is not installed.")
 
 
 def compute_aux_seq_tensors_scalars(prefix_lens: np.ndarray, causal_lens: np.ndarray, batch_max_tokens: int):
@@ -276,7 +286,67 @@ def flash_attn_varlen_prefixlm(q: Tensor,
                                prefix_lens: Tensor, causal_lens: Tensor, cu_seqlens: Tensor,
                                # CPU tensors (scalars)
                                total_seqlen: Tensor, numseqs: Tensor, max_seqlen_prefix: Tensor, max_seqlen_causal: Tensor, max_seqlen_all: Tensor):
+    if not _HAS_FLASH_ATTN_3:
+        return _torch_varlen_prefixlm(q, k, v, is_causal, prefix_lens, causal_lens, cu_seqlens, numseqs)
+
     # Apply function
     return FlashAttnVarlenPrefixLM.apply(q, k, v, is_causal,
                                          prefix_lens, causal_lens, cu_seqlens,
                                          total_seqlen, numseqs, max_seqlen_prefix, max_seqlen_causal, max_seqlen_all)
+
+
+def _sdpa(q: Tensor, k: Tensor, v: Tensor, *, attn_mask: Optional[Tensor] = None, is_causal: bool = False) -> Tensor:
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(0, 1).unsqueeze(0),
+        k.transpose(0, 1).unsqueeze(0),
+        v.transpose(0, 1).unsqueeze(0),
+        attn_mask=attn_mask,
+        is_causal=is_causal,
+    )
+    return out.squeeze(0).transpose(0, 1)
+
+
+def _torch_varlen_prefixlm(q: Tensor, k: Tensor, v: Tensor, is_causal: bool, prefix_lens: Tensor, causal_lens: Tensor, cu_seqlens: Tensor, numseqs: Tensor) -> Tensor:
+    """Small-run PyTorch fallback for non-Hopper validation.
+
+    The reference path uses FlashAttention 3. This fallback preserves PrefixLM
+    masking semantics for smoke tests and local architecture experiments.
+    """
+    out = torch.zeros_like(q)
+    n = int(numseqs.item())
+
+    prefix_lens_cpu = prefix_lens.detach().cpu()
+    causal_lens_cpu = causal_lens.detach().cpu()
+    cu_seqlens_cpu = cu_seqlens.detach().cpu()
+
+    for i in range(n):
+        start = int(cu_seqlens_cpu[i].item())
+        prefix_len = int(prefix_lens_cpu[i].item())
+        causal_len = int(causal_lens_cpu[i].item())
+        total_len = prefix_len + causal_len
+
+        if prefix_len > 0:
+            out[start:start + prefix_len] = _sdpa(
+                q[start:start + prefix_len],
+                k[start:start + prefix_len],
+                v[start:start + prefix_len],
+                is_causal=is_causal,
+            )
+
+        if causal_len > 0:
+            causal_q = q[start + prefix_len:start + total_len]
+            all_k = k[start:start + total_len]
+            all_v = v[start:start + total_len]
+
+            row_ids = torch.arange(causal_len, device=q.device).unsqueeze(1)
+            col_ids = torch.arange(total_len, device=q.device).unsqueeze(0)
+            attn_mask = col_ids <= (prefix_len + row_ids)
+
+            out[start + prefix_len:start + total_len] = _sdpa(
+                causal_q,
+                all_k,
+                all_v,
+                attn_mask=attn_mask,
+            )
+
+    return out

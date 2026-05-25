@@ -2,8 +2,14 @@
 .vscode/
 # WandB
 /wandb/
+# local Hugging Face cache
+/.hf/
+# local benchmark outputs and smoke datasets
+/outputs/
+/smoke_data/
 # datasets
 /data/
+/hrm_text_subset_*/
 # checkpoints
 /checkpoints/
 # old

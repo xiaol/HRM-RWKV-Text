@@ -49,24 +49,35 @@ class LMHead(nn.Module):
             masks = labels != IGNORE_LABEL_ID
 
             # Loss (CE in F32)
-            loss = F.cross_entropy(logits.to(torch.float32), labels.to(torch.long), ignore_index=IGNORE_LABEL_ID, reduction="sum")
+            loss = F.cross_entropy(
+                logits.to(torch.float32).flatten(0, -2),
+                labels.to(torch.long).flatten(),
+                ignore_index=IGNORE_LABEL_ID,
+                reduction="sum",
+            )
             # AllReduce loss divisor. Divide by mean of valid tokens across all processes, as gradient will be averaged.
             loss_divisor = masks.sum().to(torch.float32)
-            dist.all_reduce(loss_divisor, op=dist.ReduceOp.AVG)
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(loss_divisor, op=dist.ReduceOp.AVG)
 
             # Accuracy
             with torch.no_grad():
                 is_correct = torch.argmax(logits, dim=-1) == labels
                 local_valid_counts = masks.sum()
                 # Sequence-level statistics
-                seq_num_tokens_correct = packing_sequence_sum(is_correct, batch["cu_seqlens"])
-                seq_num_valid_tokens = packing_sequence_sum(masks, batch["cu_seqlens"])
-                seq_is_valid = seq_num_valid_tokens > 0
+                if "cu_seqlens" in batch:
+                    seq_num_tokens_correct = packing_sequence_sum(is_correct, batch["cu_seqlens"])
+                    seq_num_valid_tokens = packing_sequence_sum(masks, batch["cu_seqlens"])
+                    seq_is_valid = seq_num_valid_tokens > 0
+                    exact_accuracy = (((seq_num_tokens_correct == seq_num_valid_tokens) & seq_is_valid).sum(), seq_is_valid.sum())
+                else:
+                    seq_is_valid = masks.any(dim=-1) if masks.dim() > 1 else masks.any().view(1)
+                    exact_accuracy = (((is_correct | ~masks).all(dim=-1) & seq_is_valid).sum(), seq_is_valid.sum()) if masks.dim() > 1 else ((is_correct[masks].all() & seq_is_valid[0]).to(torch.int64), seq_is_valid.sum())
                 # Metrics
                 metrics = {
                     "loss": (loss.detach(), local_valid_counts),
                     "accuracy": (is_correct.sum(), local_valid_counts),
-                    "exact_accuracy": (((seq_num_tokens_correct == seq_num_valid_tokens) & seq_is_valid).sum(), seq_is_valid.sum()),
+                    "exact_accuracy": exact_accuracy,
                 }
 
             return new_carry, loss / loss_divisor, metrics

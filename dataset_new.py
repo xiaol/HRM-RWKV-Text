@@ -32,6 +32,7 @@ class V1DatasetMeta(pydantic.BaseModel):
     vocab_size: Optional[int] = None
     max_seq_len: int
     total_length: int
+    token_dtype: str = "int32"
 
 
 @dataclass
@@ -68,7 +69,13 @@ class V1Dataset(IterableDataset):
     def _load_dataset_before_epoch_begin(self):
         # Load tokens (only if not loaded)
         if self._data is None:
-            self._data = np.load(os.path.join(self.config.dataset_path, "tokens.npy"), mmap_mode="r")
+            tokens_bin_path = os.path.join(self.config.dataset_path, "tokens.bin")
+            tokens_npy_path = os.path.join(self.config.dataset_path, "tokens.npy")
+            if os.path.exists(tokens_bin_path):
+                dtype = np.dtype(self.metadata.token_dtype)
+                self._data = np.memmap(tokens_bin_path, mode="r", dtype=dtype)
+            else:
+                self._data = np.load(tokens_npy_path, mmap_mode="r")
 
         # Load indices
         self._data_indices = V1DatasetIndices(**{f.name: np.load(os.path.join(self.config.dataset_path, f"epoch_{self._epoch}", f"{f.name}.npy"), mmap_mode="r")
