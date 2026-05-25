@@ -181,6 +181,7 @@ class RWKV7TimeMix(nn.Module):
     def _forward_cuda(self, x: Tensor, v_first: Optional[Tensor], reset_v_first: bool) -> Tuple[Tensor, Tensor]:
         from apps.LT2 import rwkv7_cuda
 
+        x = x.contiguous()
         xr, xw, xk, xv, xa, xg = rwkv7_cuda.tmix_mix6(
             x,
             self.x_r.to(device=x.device, dtype=x.dtype),
@@ -204,14 +205,14 @@ class RWKV7TimeMix(nn.Module):
         k, neg_kk, kka = rwkv7_cuda.tmix_kk_pre(k, self.k_k.to(device=x.device, dtype=x.dtype), a, self.k_a.to(device=x.device, dtype=x.dtype), self.head_size)
         y = rwkv7_cuda.rwkv7_recurrence_cuda_bf16(r, w, k, v, neg_kk, kka, self.head_size, self.chunk_len)
         y = rwkv7_cuda.tmix_lnx_rkvres_xg(
-            y,
-            r,
-            k,
-            v,
+            y.contiguous(),
+            r.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
             self.r_k.to(device=x.device, dtype=x.dtype),
             self.ln_x.weight.to(device=x.device, dtype=x.dtype),
             self.ln_x.bias.to(device=x.device, dtype=x.dtype),
-            g,
+            g.contiguous(),
         )
         return self.output(y), v_first
 
@@ -285,7 +286,7 @@ class RWKV7ChannelMix(nn.Module):
                 from apps.LT2 import rwkv7_cuda
 
                 return rwkv7_cuda.cmix_layer(
-                    x,
+                    x.contiguous(),
                     self.x_k.to(device=x.device, dtype=x.dtype),
                     self.key.weight.to(dtype=x.dtype),
                     self.value.weight.to(dtype=x.dtype),
@@ -327,6 +328,30 @@ class RWKV7Stack(nn.Module):
             x, v_first = layer(x, v_first=v_first, reset_v_first=(idx == 0))
         return self.norm_f(x)
 
+    def _forward_packed(self, x: Tensor, cu_seqlens: Tensor, numseqs: Tensor | int) -> Tensor:
+        n = int(numseqs.item()) if isinstance(numseqs, Tensor) else int(numseqs)
+        if n <= 0:
+            return torch.zeros_like(x)
+
+        cu = cu_seqlens[: n + 1].to(device=x.device, dtype=torch.long)
+        starts = cu[:-1]
+        lengths = cu[1:] - starts
+        max_len = int(lengths.max().item())
+        if max_len <= 0:
+            return torch.zeros_like(x)
+
+        pos = torch.arange(max_len, device=x.device, dtype=torch.long).unsqueeze(0)
+        mask = pos < lengths.unsqueeze(1)
+        src = starts.unsqueeze(1) + pos
+
+        padded = x.new_zeros((n, max_len, x.shape[-1]))
+        padded[mask] = x[src[mask]]
+
+        padded_out = self._forward_batched(padded)
+        out = torch.zeros_like(x)
+        out[src[mask]] = padded_out[mask]
+        return out
+
     def forward(self, x: Tensor, cu_seqlens: Optional[Tensor] = None, numseqs: Optional[Tensor] = None, **_seq_info) -> Tensor:
         if x.dim() == 3:
             return self._forward_batched(x)
@@ -337,15 +362,7 @@ class RWKV7Stack(nn.Module):
 
         cu_seqlens = unwrap_tensor(cu_seqlens)
         numseqs = unwrap_tensor(numseqs)
-        n = int(numseqs.item()) if isinstance(numseqs, Tensor) else int(numseqs)
-        cu = cu_seqlens.detach().cpu()
-        out = torch.zeros_like(x)
-        for i in range(n):
-            start = int(cu[i].item())
-            end = int(cu[i + 1].item())
-            if end > start:
-                out[start:end] = self._forward_batched(x[start:end].unsqueeze(0)).squeeze(0)
-        return out
+        return self._forward_packed(x, cu_seqlens, numseqs)
 
 
 class RWKV7ReasoningBlock(nn.Module):

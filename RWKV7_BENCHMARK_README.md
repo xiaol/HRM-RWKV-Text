@@ -88,7 +88,7 @@ PYTHONPATH=/home/xiaol/X/LT2_upstream \
   --json-out outputs/hrm_official_1b_v1_compare_4090_h256_l4_s30.json
 ```
 
-Results:
+Initial results before packed RWKV batching:
 
 | arch | params | tok/s | supervised tok/s | train mean CE | last CE | val CE | VRAM |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -106,3 +106,28 @@ The RWKV-7 path does call the LT2 kernels, but it is still slower in this HRM-Te
 The next speed fix is to batch packed sequences inside `RWKV7Stack` instead of looping sequence-by-sequence.
 
 On RTX 4090, HRM-Text Transformer PrefixLM also uses the local PyTorch fallback rather than FlashAttention 3, because FA3 is Hopper-targeted. Hopper speed behavior will differ.
+
+## Packed RWKV Update
+
+`RWKV7Stack` now batches packed PrefixLM sequences by padding the packed `[T, C]` tensor into `[numseqs, max_seq_len, C]`, running the RWKV stack once, then scattering back to `[T, C]`. This removes the per-sequence RWKV kernel-launch loop.
+
+Same benchmark command, output:
+
+```text
+outputs/hrm_official_1b_v1_compare_4090_h256_l4_s30_packed_rwkv.json
+```
+
+| arch | params | tok/s | supervised tok/s | train mean CE | last CE | val CE | VRAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transformer` | 40.89M | 8,578 | 1,132 | 5.3036 | 3.6450 | 3.7159 | 3.96 GB |
+| `rwkv7` | 40.53M | 76,873 | 10,149 | 4.9837 | 3.5006 | 3.5359 | 6.39 GB |
+| `hybrid_h_rwkv7` | 40.71M | 16,010 | 2,114 | 4.8157 | 3.3210 | 3.4045 | 5.60 GB |
+| `hybrid_l_rwkv7` | 40.71M | 15,242 | 2,012 | 4.9637 | 3.4560 | 3.5877 | 4.77 GB |
+
+Speedup versus the initial looped RWKV path:
+
+| arch | speedup |
+| --- | ---: |
+| `rwkv7` | 37.5x |
+| `hybrid_h_rwkv7` | 5.0x |
+| `hybrid_l_rwkv7` | 4.5x |
