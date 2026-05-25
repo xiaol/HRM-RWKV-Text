@@ -1,305 +1,150 @@
-![](./assets/banner.png)
+# HRM-RWKV-Text
 
-# HRM-Text: Efficient Pretraining Beyond Scaling
+This repository is an experimental fork of HRM-Text that replaces or mixes the HRM recurrent Transformer cores with RWKV-7.
 
-<p align="center">
-  <a href="https://arxiv.org/pdf/2605.20613"><img src="https://img.shields.io/badge/Paper-arXiv-red?logo=arxiv&logoColor=white" alt="arXiv Paper"></a>
-  <a href="https://huggingface.co/sapientinc/HRM-Text-1B"><img src="https://img.shields.io/badge/Model-HuggingFace-yellow" alt="Model"></a>
-</p>
-
-<p align="center"><strong>🌟 Pretrain a foundation model from scratch with ~$1000. 🌠</strong></p>
-
-HRM-Text is a 1B text generation model based on the HRM architecture, strengthened by task completion and latent space reasoning. It offers a full pretraining framework, making foundation model pretraining accessible with 130-600x less compute and 150-900x less data. It is built upon a hierarchical recurrent architecture, PrefixLM sequence packing, FlashAttention 3 kernels, PyTorch FSDP2 training, evaluation, and checkpoint conversion tooling.
-
-![](./assets/benchmark_scatter.png)
-
-## Launch the Pretraining 🚀
-
-### Required Resources
-
-Choose a target size and prepare the corresponding GPU nodes.
-
-- **L, 0.6B parameters:** 8 H100s, single node, about 50 hours (~$800).
-- **XL, 1B parameters:** 16 H100s, two nodes, about 46 hours (~$1472).
-
-*Price estimation based on $2/H100 hour.*
-
-The following are benchmark results from the reference runs.
-
-| Size | GPUs | Time | GSM8k | MATH | DROP | MMLU | ARC-C | HellaSwag | Winogrande | BoolQ |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **L (0.6B)** | 8 | 50 hrs | 77.6% | 51.2% | 78.6% | 56.6% | 75.9% | 52.7% | 67.6% | 85.0% |
-| **XL (1B)** | 16 | 46 hrs | 84.7% | 56.5% | 82.3% | 60.7% | 81.9% | 63.4% | 72.4% | 86.2% |
-
-> Hopper-class GPUs are the expected training target because the attention path depends on FlashAttention 3.
-
-### 1. Prepare Data
-
-HRM-Text trains from sampled, tokenized data produced by the companion `data_io` pipeline. Use `data_io` to clean, tokenize, and stratified-sample the pretraining corpus, then point HRM-Text at the sampled output.
-
-<p align="center">
-  <a href="https://github.com/sapientinc/data_io"><img alt="data_io" src="https://img.shields.io/badge/GitHub-sapientinc%2Fdata__io-181717?logo=github&logoColor=white"></a>
-</p>
-
-Recommended setups:
-
-1. **Single node:** run the data pipeline and pretraining on the same node. After tokenization, stratified-sample into that node's shared memory at `/dev/shm/sampled`.
-2. **Multi-node:** keep `data_io` and the tokenized data on shared storage. Mount or expose that directory on every pretraining node, then run stratified sampling independently on each node. Sampling is fast and deterministic, so every node produces the same in-memory training data.
-
-Please first setup `data_io`, then run the pipeline. After tokenization, run stratified sampling on each training node.
-
-```bash
-cd <DATA_IO_PATH>
-python sample_tokenized.py epochs=4 output_path=/dev/shm/sampled > show_analytics.md
-```
-
-HRM-Text uses 4 training epochs by default. If you change `epochs` in the training config, change the sampling command to match.
-
-### 2. Start the Environment
-
-Set up the same environment on every pretraining node.
-
-#### Recommended: Docker
-
-We recommend running through the published Docker image that contains the full environment. Make sure Docker can see your GPUs, for example through NVIDIA Container Toolkit.
-
-From the repo's directory:
-
-```bash
-docker run --gpus all --ipc=host --network=host -it \
-  -v "$PWD":/workspace \
-  sapientai/hrm-text:latest
-```
-
-For multi-node runs, mount the same shared workspace on every node. Keeping the code, tokenized data, and checkpoint directory at identical paths avoids version drift between ranks and makes FSDP2 checkpointing straightforward. A common layout is:
+Original upstream project:
 
 ```text
-/shared/
-|-- HRM-Text/
-   |--- checkpoints/
-|-- data_io/
+https://github.com/sapientinc/HRM-Text
 ```
 
-#### Alternative: Install from Source
+Refer to upstream HRM-Text for the original paper, architecture, training framework, evaluation stack, and license context. This fork is focused on local architecture validation and speed/loss comparison for RWKV-7 inside HRM-Text.
 
-If you are not using Docker, first install PyTorch, CUDA, and FlashAttention 3. The tested versions are documented in [`docker/Dockerfile`](docker/Dockerfile).
+## What Changed
 
-Then install the Python dependencies:
+Added HRM core variants:
 
-```bash
-pip install -r requirements.txt
-```
+| config / benchmark name | H core | L core |
+| --- | --- | --- |
+| `transformer` | Transformer | Transformer |
+| `rwkv7` / `hrm_rwkv7` | RWKV-7 | RWKV-7 |
+| `hybrid_h_rwkv7` / `hrm_h_rwkv7` | RWKV-7 | Transformer |
+| `hybrid_l_rwkv7` / `hrm_l_rwkv7` | Transformer | RWKV-7 |
 
-#### Check Distributed Communication
-
-For multi-node runs, verify NCCL before starting a long job. At minimum, confirm that `torchrun` can initialize across the intended nodes. If your cluster provides `nccl-tests`, run both intra-node and inter-node bandwidth checks.
-
-#### Set Up W&B Tracking
-
-HRM-Text logs training metrics to [Weights & Biases](https://wandb.ai/). Log in before launching training:
-
-```bash
-wandb login
-```
-
-For headless runs, get an API key from <https://wandb.ai/authorize> and run:
-
-```bash
-wandb login <API_KEY>
-```
-
-### 3. Launch Pretraining
-
-For the **L**-size reference run on one 8xH100 node:
-
-```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-torchrun --nproc_per_node=8 pretrain.py arch/size@arch=L lr=2.5e-4 global_batch_size=172032
-```
-
-For the **XL**-size reference run on two 8xH100 nodes, run this on each node:
-
-```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-torchrun \
-  --nproc_per_node=8 \
-  --nnodes=2 \
-  --node_rank=<NODE_RANK> \
-  --master_addr=<MASTER_ADDR> \
-  --master_port=<MASTER_PORT> \
-  pretrain.py
-```
-
-Checkpoints are saved every epoch under `checkpoints/`. Remember for multi-node runs, each node only saves its own shard, so we recommend mounting a shared storage.
-
-### 4. Evaluate
-
-Evaluation loads the latest checkpoint epoch automatically when `ckpt_epoch` is not provided:
-
-```bash
-python -m evaluation.main ckpt_path="checkpoints/..."
-```
-
-To run a specified set of benchmarks, append `run_only=[MATH,DROP,ARC,MMLU]` to the command
-
-Evaluation typically needs one 80 GB GPU. If evaluation runs out of memory, lower the batch size by adding `generation_config.batch_size=16`
-
-The evaluation scripts use Hugging Face `datasets`, so benchmark data is downloaded on demand.
-
-### 5. Export to Transformers Format
-
-```bash
-python -m conversion.convert_to_hf \
-  --ckpt_path "checkpoints/..." \
-  --out_dir "<OUTPUT_PATH>"
-```
-
-For evaluation and export, EMA weights are used by default when EMA is present in the checkpoint.
-
-## Fine-Tuning (SFT)
-
-Continue-train a pretrain checkpoint on instruction data. Full-parameter only.
-
-Input is a JSONL with one object per line; `condition` defaults to `direct`:
-
-```json
-{"instruction": "<full prompt>", "response": "<expected output>", "condition": "direct"}
-```
-
-### 1. Prepare Data
-
-```bash
-python scripts/prepare_sft_data.py \
-  --train your.jsonl \
-  --tokenizer /path/to/tokenizer.json \
-  --output /dev/shm/sft_data \
-  --epochs <N>
-```
-
-`--epochs` must equal the training epochs (one pre-shuffle per epoch).
-
-### 2. Launch Training
-
-```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-torchrun --nproc_per_node=8 pretrain.py \
-  --config-name cfg_sft \
-  arch/size@arch=XL \
-  data.path=/dev/shm/sft_data \
-  resume_from=/path/to/pretrain_ckpt \
-  +checkpoint_path=/path/to/sft_out
-```
-
-`resume_from` loads both model weights and optimizer state (including EMA) by default. Add `weights_only_resume_from_ema=true` to swap the pretrain EMA buffer into the model and start with a fresh optimizer — typical when fine-tuning off a pretrain run. The `arch/*` flags must match the pretrain checkpoint's `all_config.yaml` (override `arch.n_layers` etc. if it differs from the size preset).
-
-## Status
-
-- Training, checkpointing, and evaluation are implemented in this repository.
-- Transformers-format export is implemented in [`conversion/convert_to_hf.py`](conversion/convert_to_hf.py).
-- Native Transformers model support is merged and scheduled for the next release.
-- Native vLLM support for HRM-Text checkpoints is in progress.
-
-## Training Overrides
-
-The default pretraining config is [`config/cfg_pretrain.yaml`](config/cfg_pretrain.yaml):
-
-If `project_name`, `run_name`, or `checkpoint_path` are omitted, rank 0 derives them from the dataset path, architecture name, and a generated slug.
-
-Hydra overrides can be passed directly on the command line:
-
-```bash
-# Train a vanilla Transformer architecture, size L
-torchrun --nproc_per_node=8 pretrain.py \
-  arch/net@arch=transformer \
-  arch/size@arch=L
-```
-
-## Model Configurations
-
-Architectures live under [`config/arch/net`](config/arch/net):
-
-| Config | Model |
-| --- | --- |
-| `hrm` | HRM-Text |
-| `transformer` | Standard Transformer wrapper |
-| `trm` | Tiny Recursive Model baseline |
-| `trm_match_recurrence` | TRM configured to match HRM recurrence with half parameters |
-| `rins` | Recursive Inference Scaling (RINS) baseline |
-| `ut` | Universal Transformer baseline |
-
-Sizes live under [`config/arch/size`](config/arch/size):
-
-| Config | Layers | Hidden | Heads |
-| --- | ---: | ---: | ---: |
-| `B` | 12 | 1024 | 8 |
-| `L` | 24 | 1280 | 10 |
-| `XL` | 32 | 1536 | 12 |
-| `XXL` | 72 | 1792 | 14 |
-| `XXL_wide` | 32 | 2560 | 20 |
-
-For HRM and RINS, `half_layers: true` splits the configured layer count evenly between the H and L modules.
-
-## Repository Layout
+Key files:
 
 ```text
-HRM-Text/
-|-- config/                       # Hydra configs for model, data, and training
-|-- conversion/convert_to_hf.py    # FSDP2 checkpoint -> HF-style export
-|-- evaluation/                    # Evaluation engines, benchmark wrappers, configs
-|-- models/                        # HRM, recurrent baselines, Transformer blocks, LM head
-|-- docker/                        # Tested CUDA/PyTorch/FlashAttention environment
-|-- dataset_new.py                 # PrefixLM packed dataset loader
-|-- multipack_sampler.py           # Distributed multipack batch sampler
-|-- pretrain.py                    # FSDP2 pretraining entrypoint
-|-- simple_inference_engine.py     # Checkpoint loader and compiled generation engine
-`-- requirements.txt
+models/rwkv7.py
+models/baselines/hrm_rwkv7_nocarry_bp_warmup.py
+models/baselines/hrm_hybrid_rwkv7_nocarry_bp_warmup.py
+config/arch/net/hrm_rwkv7.yaml
+config/arch/net/hrm_h_rwkv7.yaml
+config/arch/net/hrm_l_rwkv7.yaml
+scripts/benchmark_hrm_rwkv7.py
+scripts/prepare_hf_subset_data.py
 ```
 
-## Technical Notes
+The RWKV-7 implementation can use LT2 CUDA kernels via:
 
-- [`dataset_new.py`](dataset_new.py) loads sampled `tokens.npy` and per-epoch index arrays, builds PrefixLM batches, masks instruction tokens by default, and emits FlashAttention sequence metadata.
-- [`multipack_sampler.py`](multipack_sampler.py) implements distributed multipack batching with LPT allocation to improve token-slot utilization and balance quadratic attention work.
-- [`models/flash_attention_prefixlm_v2.py`](models/flash_attention_prefixlm_v2.py) implements the two-pass PrefixLM attention path: one bidirectional pass over the prefix region and one causal pass over the response region.
-- [`models/layers.py`](models/layers.py) contains RoPE, gated multi-head attention, SwiGLU MLPs, static KV cache helpers, and initialization utilities.
-- [`models/baselines/hrm_nocarry_bp_warmup.py`](models/baselines/hrm_nocarry_bp_warmup.py) contains the main HRM-Text architecture.
-- [`models/lm_head.py`](models/lm_head.py) attaches scaled embeddings, the output head, cross-entropy loss, token accuracy, and sequence exact accuracy.
-- [`pretrain.py`](pretrain.py) handles FSDP2 wrapping, optimizer creation, LR schedule, W&B logging, code/config snapshots, and distributed checkpointing.
-
-## Contributions
-
-We welcome contributions that make HRM-Text faster, stronger, or easier to use.
-
-Please send data-pipeline changes to the companion `data_io` project. Send model, training, inference, evaluation, conversion, infrastructure, and documentation changes here.
-
-Recommended PR categories:
-
-- **Docs and tutorials:** clarify setup, data prep, launch recipes, evaluation, or checkpoint conversion.
-- **Evaluation and inference:** add benchmark wrappers, improve generation throughput, reduce VRAM, or improve result reporting.
-- **Training infrastructure:** improve FSDP2 stability, efficiency, checkpointing, launch ergonomics, logging, or cluster portability.
-- **Model and optimizer changes:** improve the architecture, recurrence schedule, initialization, attention path, optimizer, or training hyperparameters.
-
-For changes that alter pretraining behavior, we strongly recommend running pretraining at an appropriate scale and including downstream benchmark comparisons against the reference.
-
-For infrastructure changes intended to be behavior-preserving, include before/after speed, memory, or stability measurements and show that benchmark quality does not regress.
-
-For model-quality changes, we evaluate whether the change improves the Pareto frontier of training compute versus performance. Strict improvements and high-ROI changes are good candidates for defaults; valuable tradeoffs with higher cost or lower performance may belong in separate configs.
-
-## Citation
-
-If you find this project or our paper useful, please consider citing our paper:
-
-```
-@misc{wang2026hrmtextefficientpretrainingscaling,
-      title={HRM-Text: Efficient Pretraining Beyond Scaling}, 
-      author={Guan Wang and Changling Liu and Chenyu Wang and Cai Zhou and Yuhao Sun and Yifei Wu and Shuai Zhen and Luca Scimeca and Yasin Abbasi Yadkori},
-      year={2026},
-      eprint={2605.20613},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2605.20613}, 
-}
+```bash
+PYTHONPATH=/path/to/LT2_upstream
 ```
 
-## License
+For the full RWKV-7 CUDA path, use:
 
-Apache License 2.0
+```text
+dtype=bf16
+rwkv7_backend=cuda
+rwkv7_head_size=64
+rwkv7_expansion=1.0
+```
+
+The RWKV path calls the LT2 kernels for time mix, recurrence, layernorm/RKV residual/gate, and channel mix.
+
+## Official 1B-Token Subset
+
+The full HRM-Text cleaned pretraining dataset is large, so this fork includes a compact subset builder. It streams rows from:
+
+```text
+sapientinc/HRM-Text-data-io-cleaned-20260515
+```
+
+and writes HRM `V1Dataset` format using compact `uint16` token storage.
+
+Example command:
+
+```bash
+HF_HOME=/home/xiaol/.cache/huggingface \
+.venv/bin/python scripts/prepare_hf_subset_data.py \
+  --hf-dataset sapientinc/HRM-Text-data-io-cleaned-20260515 \
+  --split train \
+  --streaming \
+  --tokenizer outputs/hrm_official_assets/tokenizer.json \
+  --output /home/xiaol/X/hrm_text_subset_1B \
+  --epochs 1 \
+  --context-size 4097 \
+  --target-tokens 1000000000 \
+  --compact-uint16
+```
+
+Local generated subset used for the benchmark:
+
+```text
+tokens: 1,000,000,035
+rows: 26,620,178
+disk: 2.7 GB
+```
+
+Generated datasets and benchmark outputs are intentionally not committed.
+
+## Benchmark
+
+4090 benchmark command:
+
+```bash
+PYTHONPATH=/home/xiaol/X/LT2_upstream \
+.venv/bin/python scripts/benchmark_hrm_rwkv7.py \
+  --mode v1 \
+  --device cuda \
+  --dtype bf16 \
+  --archs transformer,rwkv7,hybrid_h_rwkv7,hybrid_l_rwkv7 \
+  --warmup-steps 3 \
+  --steps 30 \
+  --v1-batch-tokens 4096 \
+  --v1-eval-batch-tokens 4096 \
+  --v1-val-batches 10 \
+  --seq-len 4096 \
+  --hidden-size 256 \
+  --n-layers 4 \
+  --num-heads 4 \
+  --transformer-expansion 4.0 \
+  --rwkv7-expansion 1.0 \
+  --h-cycles 2 \
+  --l-cycles 2 \
+  --bp-steps 3 \
+  --vocab-size 65536 \
+  --rwkv7-head-size 64 \
+  --rwkv7-backend cuda \
+  --json-out outputs/hrm_official_1b_v1_compare_4090_h256_l4_s30_packed_rwkv.json
+```
+
+Current result after batching packed RWKV sequences:
+
+| arch | params | tok/s | supervised tok/s | train mean CE | last CE | val CE | VRAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transformer` | 40.89M | 8,578 | 1,132 | 5.3036 | 3.6450 | 3.7159 | 3.96 GB |
+| `rwkv7` | 40.53M | 76,873 | 10,149 | 4.9837 | 3.5006 | 3.5359 | 6.39 GB |
+| `hybrid_h_rwkv7` | 40.71M | 16,010 | 2,114 | 4.8157 | 3.3210 | 3.4045 | 5.60 GB |
+| `hybrid_l_rwkv7` | 40.71M | 15,242 | 2,012 | 4.9637 | 3.4560 | 3.5877 | 4.77 GB |
+
+This is a short training-process validation run, not a final model-quality result.
+
+## Speed Notes
+
+The first RWKV implementation looped over PrefixLM-packed sequences one by one, which caused many tiny kernel launches. `RWKV7Stack` now pads packed `[T, C]` batches into `[numseqs, max_seq_len, C]`, runs the RWKV stack once, and scatters back to `[T, C]`.
+
+Speedup on the same benchmark:
+
+| arch | speedup |
+| --- | ---: |
+| `rwkv7` | 37.5x |
+| `hybrid_h_rwkv7` | 5.0x |
+| `hybrid_l_rwkv7` | 4.5x |
+
+On RTX 4090, Transformer PrefixLM uses the local PyTorch fallback rather than FlashAttention 3 because FA3 targets Hopper. Hopper behavior will differ.
+
+More detailed notes are in:
+
+```text
+RWKV7_BENCHMARK_README.md
+```
