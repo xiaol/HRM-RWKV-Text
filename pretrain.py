@@ -77,6 +77,7 @@ class PretrainConfig(pydantic.BaseModel):
 
     # Extras
     seed: int = 0
+    max_steps: Optional[int] = None
     checkpoint_interval: int = 1
     log_interval: int = 5
 
@@ -456,6 +457,12 @@ def launch(hydra_config: DictConfig):
                     )
 
             del metrics
+
+            if config.max_steps is not None and train_state.step >= config.max_steps:
+                break
+
+        if config.max_steps is not None and train_state.step >= config.max_steps:
+            break
 
         ############ EVAL STACK: TBD TODO
 

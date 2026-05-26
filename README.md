@@ -154,7 +154,7 @@ The local 4090 comparison uses the 1B-token official subset and a common `1024` 
 
 This is still a short validation run, not full 1B-token pretraining.
 
-For actual local training with the upstream L effective batch, keep `global_batch_size=172032` and use gradient accumulation with the 4090-safe microbatch:
+For actual local training with the upstream L effective batch, keep `global_batch_size=172032` and use gradient accumulation with the 4090-safe pretrain microbatch:
 
 ```bash
 WANDB_MODE=offline \
@@ -165,14 +165,16 @@ PYTHONPATH=/home/xiaol/X/LT2_upstream \
   arch/size@arch=L \
   data.path=/home/xiaol/X/hrm_text_subset_1B \
   global_batch_size=172032 \
-  micro_batch_size=1024 \
+  micro_batch_size=512 \
   epochs=1 \
+  max_steps=1 \
+  checkpoint_interval=999 \
   compile_train=false \
   arch.rwkv7_backend=cuda \
-  run_name=hrm_rwkv7_l_1b_subset_b172k_micro1024
+  run_name=hrm_rwkv7_l_1b_subset_b172k_micro512
 ```
 
-That gives `172032 / 1024 = 168` gradient-accumulation microsteps per optimizer step on one 4090.
+That gives `172032 / 512 = 336` gradient-accumulation microsteps per optimizer step on one 4090. A one-step 1B-subset smoke test passed with this setting in about 99 seconds; `micro_batch_size=1024` OOMed during the pretrain CE/loss path.
 
 ## Speed Notes
 

@@ -180,4 +180,4 @@ Results:
 
 On this 4090, pure RWKV-7 fits reliably at `1024` packed tokens with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`; it OOMs at `2048` in this L-size training benchmark. The Transformer baseline can fit larger microbatches, but `1024` is the common local setting for same-batch architecture comparison.
 
-The upstream L reference run uses `global_batch_size=172032` tokens on 8 H100s. On a single 4090, set `micro_batch_size=1024` to keep that effective batch through 168 gradient-accumulation microsteps.
+The upstream L reference run uses `global_batch_size=172032` tokens on 8 H100s. For the real pretrain path on a single 4090, use `micro_batch_size=512` to keep that effective batch through 336 gradient-accumulation microsteps. A one-step 1B-subset smoke test passed in about 99 seconds; `micro_batch_size=1024` OOMed during CE/loss allocation in the FSDP pretrain path.
