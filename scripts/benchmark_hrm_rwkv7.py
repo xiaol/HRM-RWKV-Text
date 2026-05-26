@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import glob
 import json
 import math
@@ -156,7 +157,7 @@ def common_config(args: argparse.Namespace, arch: str) -> dict:
         "pos_emb_type": "rope",
         "rope_theta": 10000.0,
         "init_type": "lecun_normal",
-        "half_layers": False,
+        "half_layers": args.half_layers,
         "H_cycles": args.h_cycles,
         "L_cycles": args.l_cycles,
         "H_override": {},
@@ -206,6 +207,13 @@ def build_model(args: argparse.Namespace, arch: str, device: torch.device) -> to
     else:
         raise ValueError(args.dtype)
     return model
+
+
+def clear_cuda_cache(device: torch.device) -> None:
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
 
 
 def count_params(model: torch.nn.Module) -> int:
@@ -500,6 +508,7 @@ def main() -> None:
     parser.add_argument("--vocab-size", type=int, default=1024)
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--n-layers", type=int, default=2)
+    parser.add_argument("--half-layers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--expansion", type=float, default=0.5)
     parser.add_argument("--transformer-expansion", type=float, default=None)
@@ -532,7 +541,9 @@ def main() -> None:
         train_pattern = args.train_pattern or str(Path(args.data_dir) / "fineweb_train_*.bin")
         files = resolve_files(train_pattern, args.max_train_shards)
         for arch in archs:
+            clear_cuda_cache(device)
             results.append(run_arch(args, arch, files, device))
+            clear_cuda_cache(device)
 
         print("arch,H_arch,L_arch,params,expansion,transformer_expansion,rwkv7_expansion,rwkv7_full_channel_cuda_eligible,tokens_per_second,first_loss,last_loss,loss_delta,mean_loss,peak_memory_mb,val_loss")
         for result in results:
@@ -546,7 +557,9 @@ def main() -> None:
             )
     else:
         for arch in archs:
+            clear_cuda_cache(device)
             results.append(run_v1_arch(args, arch, device))
+            clear_cuda_cache(device)
 
         print("arch,H_arch,L_arch,params,rwkv7_full_channel_cuda_eligible,tokens_per_second,supervised_tokens_per_second,first_loss,last_loss,loss_delta,mean_loss,val_loss,peak_memory_mb")
         for result in results:

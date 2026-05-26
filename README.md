@@ -89,7 +89,7 @@ Generated datasets and benchmark outputs are intentionally not committed.
 
 ## Benchmark
 
-4090 benchmark command:
+Small 40M validation benchmark command:
 
 ```bash
 PYTHONPATH=/home/xiaol/X/LT2_upstream \
@@ -128,6 +128,31 @@ Current result after batching packed RWKV sequences:
 | `hybrid_l_rwkv7` | 40.71M | 15,242 | 2,012 | 4.9637 | 3.4560 | 3.5877 | 4.77 GB |
 
 This is a short training-process validation run, not a final model-quality result.
+
+## Local 0.6B-Size Baseline
+
+For the upstream HRM-Text L/0.6B shape on a local RTX 4090, use:
+
+```text
+hidden_size=1280
+n_layers=24
+half_layers=true
+num_heads=10
+H_cycles=2
+L_cycles=3
+bp_steps=5
+```
+
+The local 4090 comparison uses the 1B-token official subset and a common `1024` packed-token microbatch. Pure RWKV-7 needs `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and OOMs at `2048` packed tokens in this L-size training benchmark.
+
+| arch | params | tok/s | supervised tok/s | train mean CE | last CE | val CE | VRAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transformer` | 694.68M | 1,691 | 233 | 4.2500 | 3.6556 | 3.2188 | 8.57 GB |
+| `rwkv7` | 667.62M | 3,662 | 504 | 4.0606 | 3.5916 | 3.2192 | 21.28 GB |
+| `hybrid_h_rwkv7` | 681.15M | 2,037 | 280 | 3.8253 | 3.5945 | 3.1869 | 13.64 GB |
+| `hybrid_l_rwkv7` | 681.15M | 2,643 | 364 | 4.3985 | 3.6666 | 3.2319 | 16.21 GB |
+
+This is still a short validation run, not full 1B-token pretraining.
 
 ## Speed Notes
 

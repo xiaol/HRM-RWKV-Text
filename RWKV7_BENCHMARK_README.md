@@ -131,3 +131,53 @@ Speedup versus the initial looped RWKV path:
 | `rwkv7` | 37.5x |
 | `hybrid_h_rwkv7` | 5.0x |
 | `hybrid_l_rwkv7` | 4.5x |
+
+## Local 0.6B-Size Baseline
+
+To match the upstream HRM-Text L/0.6B shape locally, the benchmark must use `--half-layers`. Without it, `n_layers=24` builds 24 layers per H/L level and produces a roughly 1.2B-parameter model in this helper. With `--half-layers`, each H/L level gets 12 layers, matching the upstream L config.
+
+This run uses the 1B-token official subset above, not the full pretraining corpus. It is intended as a local training-process and architecture comparison on a single RTX 4090.
+
+Command:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+PYTHONPATH=/home/xiaol/X/LT2_upstream \
+.venv/bin/python scripts/benchmark_hrm_rwkv7.py \
+  --mode v1 \
+  --device cuda \
+  --dtype bf16 \
+  --archs transformer,rwkv7,hybrid_h_rwkv7,hybrid_l_rwkv7 \
+  --warmup-steps 3 \
+  --steps 30 \
+  --v1-batch-tokens 1024 \
+  --v1-eval-batch-tokens 1024 \
+  --v1-val-batches 10 \
+  --seq-len 4096 \
+  --hidden-size 1280 \
+  --n-layers 24 \
+  --half-layers \
+  --num-heads 10 \
+  --transformer-expansion 4.0 \
+  --rwkv7-expansion 1.0 \
+  --h-cycles 2 \
+  --l-cycles 3 \
+  --bp-steps 5 \
+  --vocab-size 65536 \
+  --rwkv7-head-size 64 \
+  --rwkv7-backend cuda \
+  --json-out outputs/l06_official_1b_v1_compare_4090_b1024_s30.json
+```
+
+Results:
+
+| arch | params | tok/s | supervised tok/s | train mean CE | last CE | val CE | VRAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transformer` | 694.68M | 1,691 | 233 | 4.2500 | 3.6556 | 3.2188 | 8.57 GB |
+| `rwkv7` | 667.62M | 3,662 | 504 | 4.0606 | 3.5916 | 3.2192 | 21.28 GB |
+| `hybrid_h_rwkv7` | 681.15M | 2,037 | 280 | 3.8253 | 3.5945 | 3.1869 | 13.64 GB |
+| `hybrid_l_rwkv7` | 681.15M | 2,643 | 364 | 4.3985 | 3.6666 | 3.2319 | 16.21 GB |
+
+On this 4090, pure RWKV-7 fits reliably at `1024` packed tokens with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`; it OOMs at `2048` in this L-size training benchmark. The Transformer baseline can fit larger microbatches, but `1024` is the common local setting for same-batch architecture comparison.
+
+The upstream L reference run uses `global_batch_size=172032` tokens on 8 H100s. Matching that effective batch on a single 4090 with `1024` packed tokens would require about 168 gradient-accumulation microsteps, which is not implemented in the current pretrain entrypoint.
