@@ -8,6 +8,7 @@ hydra:
   output_subdir: null
 
 global_batch_size: 196608  # Batch size (tokens)
+micro_batch_size: null     # Per-forward token budget; set smaller than global_batch_size for gradient accumulation
 epochs: 4
 checkpoint_interval: 1
 
@@ -20,3 +21,16 @@ beta1: 0.9
 beta2: 0.95
 
 ema: 0.9999
+fwd_bwd_dtype: bfloat16
+compile_train: true
+
+project_name: null
+run_name: null
+checkpoint_path: null
+
+resume_from: null
+resume_epoch: null
+weights_only_resume_from_ema: false
+
+seed: 0
+log_interval: 5

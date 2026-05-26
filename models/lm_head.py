@@ -31,7 +31,13 @@ class LMHead(nn.Module):
         self.embed_tokens = ScaledEmbeddingInit(config.vocab_size, head_hint["in"]["dim"], init_std=head_hint["in"]["init_std"])  # pyright: ignore[reportArgumentType]
         self.lm_head = LinearInit(head_hint["out"]["dim"], config.vocab_size, bias=False, init_std=head_hint["out"]["init_std"])  # pyright: ignore[reportArgumentType]
 
-    def forward(self, carry: Carry, batch: dict[str, Tensor], **kwargs) -> Tuple[Carry, Tensor] | Tuple[Carry, Tensor, dict[str, Tuple[Tensor, Tensor]]]:
+    def forward(
+        self,
+        carry: Carry,
+        batch: dict[str, Tensor],
+        loss_divisor_override: Tensor | None = None,
+        **kwargs,
+    ) -> Tuple[Carry, Tensor] | Tuple[Carry, Tensor, dict[str, Tuple[Tensor, Tensor]]]:
         # Token embedding
         input_embedding = self.embed_tokens(batch["inputs"])
 
@@ -56,9 +62,12 @@ class LMHead(nn.Module):
                 reduction="sum",
             )
             # AllReduce loss divisor. Divide by mean of valid tokens across all processes, as gradient will be averaged.
-            loss_divisor = masks.sum().to(torch.float32)
-            if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(loss_divisor, op=dist.ReduceOp.AVG)
+            if loss_divisor_override is None:
+                loss_divisor = masks.sum().to(torch.float32)
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(loss_divisor, op=dist.ReduceOp.AVG)
+            else:
+                loss_divisor = loss_divisor_override.to(device=loss.device, dtype=torch.float32)
 
             # Accuracy
             with torch.no_grad():

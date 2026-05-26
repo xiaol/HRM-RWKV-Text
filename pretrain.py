@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional
 from dataclasses import dataclass
 from pathlib import Path
 from glob import glob
@@ -23,7 +23,7 @@ import pydantic
 from omegaconf import DictConfig, OmegaConf
 
 from models.layers import Carry
-from models.common import wrap_tensor
+from models.common import IGNORE_LABEL_ID, wrap_tensor
 from models.transformer import TransformerBlock
 from models.adam_atan2 import AdamATan2
 from utils.functions import load_model_class, get_model_source_path
@@ -51,6 +51,7 @@ class PretrainConfig(pydantic.BaseModel):
 
     # Hyperparams
     global_batch_size: int
+    micro_batch_size: Optional[int] = None
     epochs: int
 
     lr: float
@@ -62,6 +63,7 @@ class PretrainConfig(pydantic.BaseModel):
     beta2: float
     ema: Optional[float] = None
     fwd_bwd_dtype: str = "bfloat16"
+    compile_train: bool = True
 
     # Names
     project_name: Optional[str] = None
@@ -164,15 +166,27 @@ def create_model_and_carry(config: PretrainConfig, train_metadata: V1DatasetMeta
     return model, carry, optim
 
 
-def init_train(config: PretrainConfig, rank: int, world_size: int):
+def get_local_micro_batch_size(config: PretrainConfig, world_size: int) -> int:
     assert config.global_batch_size % world_size == 0, f"Global batch size {config.global_batch_size} must be divisible by world size {world_size}."
-    local_batch_size = config.global_batch_size // world_size
+    local_effective_batch_size = config.global_batch_size // world_size
+    if config.micro_batch_size is None:
+        return local_effective_batch_size
+    assert config.micro_batch_size > 0, "micro_batch_size must be positive."
+    assert local_effective_batch_size % config.micro_batch_size == 0, (
+        f"Local effective batch size {local_effective_batch_size} must be divisible by "
+        f"micro_batch_size {config.micro_batch_size}."
+    )
+    return config.micro_batch_size
+
+
+def init_train(config: PretrainConfig, rank: int, world_size: int):
+    local_micro_batch_size = get_local_micro_batch_size(config, world_size)
 
     # Dataset
-    train_loader, train_metadata = create_dataloader(config, local_batch_size, drop_last_batch=True,  rank=rank, world_size=world_size)
+    train_loader, train_metadata = create_dataloader(config, local_micro_batch_size, drop_last_batch=True,  rank=rank, world_size=world_size)
 
     # Model
-    model, carry, optim = create_model_and_carry(config, train_metadata, local_batch_size)
+    model, carry, optim = create_model_and_carry(config, train_metadata, local_micro_batch_size)
 
     # Train state
     # Estimated total training steps
@@ -212,6 +226,20 @@ def train_batch(train_state: TrainState, batch: dict[str, Tensor], **kwargs):
     return metrics
 
 
+def train_microbatch(train_state: TrainState, batch: dict[str, Tensor], loss_divisor: Tensor, **kwargs):
+    train_state.carry, loss, metrics = train_state.model(
+        batch=batch,
+        carry=train_state.carry,
+        loss_divisor_override=loss_divisor,
+        **kwargs,
+    )
+    loss.backward()
+    return metrics
+
+
+train_microbatch_compiled = torch.compile(train_microbatch, dynamic=False)
+
+
 def move_batch_to_device(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
     moved = {}
     for k, v in batch.items():
@@ -220,6 +248,10 @@ def move_batch_to_device(batch: dict[str, Tensor], device: torch.device) -> dict
         else:
             moved[k] = v
     return moved
+
+
+def move_batch_info_to_device(batch_info: dict[str, Any]) -> dict[str, Tensor]:
+    return {k: wrap_tensor(torch.tensor(v, device="cpu")) for k, v in batch_info.items()}
 
 
 @torch.inference_mode()
@@ -350,6 +382,10 @@ def launch(hydra_config: DictConfig):
     # --- Training
     train_state, train_loader, train_metadata = init_train(config, rank=RANK, world_size=WORLD_SIZE)
     load_checkpoint(config, train_state)
+    local_effective_batch_size = config.global_batch_size // WORLD_SIZE
+    local_micro_batch_size = get_local_micro_batch_size(config, WORLD_SIZE)
+    grad_accum_steps = local_effective_batch_size // local_micro_batch_size
+    train_microbatch_fn = train_microbatch_compiled if config.compile_train else train_microbatch
 
     # Progress bar and logger
     progress_bar = None
@@ -367,20 +403,57 @@ def launch(hydra_config: DictConfig):
 
         # ############ Train Iter
         train_state.model.train()
-        for batch, batch_info in train_loader:
-            batch = move_batch_to_device(batch, device)
+        microbatch_iter = iter(train_loader)
+        while True:
+            microbatches: list[dict[str, Tensor]] = []
+            microbatch_infos: list[dict[str, Tensor]] = []
+            local_valid_tokens = torch.tensor(0, dtype=torch.float32, device="cpu")
+            for _i in range(grad_accum_steps):
+                try:
+                    batch, batch_info = next(microbatch_iter)
+                except StopIteration:
+                    break
+
+                microbatches.append(batch)
+                microbatch_infos.append(move_batch_info_to_device(batch_info))
+                local_valid_tokens += (batch["labels"] != IGNORE_LABEL_ID).sum(dtype=torch.float32)
+
+            if len(microbatches) != grad_accum_steps:
+                break
+
             train_state.step += 1            
             lr = update_lr(config, train_state)
             # Extra train arguments (such as BP warmup etc.)
             train_extra_args = train_state.model.compute_train_extra_args(train_state)  # pyright: ignore[reportCallIssue]
-            
-            metrics = train_batch(train_state, batch | {k: wrap_tensor(torch.tensor(v, device="cpu")) for k, v in batch_info.items()}, **train_extra_args)
+            loss_divisor = local_valid_tokens.detach().to(device)
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(loss_divisor, op=dist.ReduceOp.AVG)
+
+            train_state.optim.zero_grad()
+            metrics_accum: Optional[dict[str, tuple[Tensor, Tensor]]] = None
+            for batch, batch_info in zip(microbatches, microbatch_infos):
+                batch = move_batch_to_device(batch, device)
+                metrics = train_microbatch_fn(train_state, batch | batch_info, loss_divisor=loss_divisor, **train_extra_args)
+                if metrics_accum is None:
+                    metrics_accum = {k: (v[0].detach(), v[1].detach()) for k, v in metrics.items()}
+                else:
+                    metrics_accum = {
+                        k: (metrics_accum[k][0] + v[0].detach(), metrics_accum[k][1] + v[1].detach())
+                        for k, v in metrics.items()
+                    }
+                del metrics
+            train_state.optim.step()
+            metrics = metrics_accum
+            assert metrics is not None
 
             if train_state.step % config.log_interval == 0:
                 metrics = reduce_metrics(metrics, prefix="train/")
                 if RANK == 0:
                     progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
-                    wandb.log(metrics | train_extra_args | {"train/lr": lr}, step=train_state.step)
+                    wandb.log(
+                        metrics | train_extra_args | {"train/lr": lr, "train/grad_accum_steps": grad_accum_steps},
+                        step=train_state.step,
+                    )
 
             del metrics
 

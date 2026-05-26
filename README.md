@@ -154,6 +154,26 @@ The local 4090 comparison uses the 1B-token official subset and a common `1024` 
 
 This is still a short validation run, not full 1B-token pretraining.
 
+For actual local training with the upstream L effective batch, keep `global_batch_size=172032` and use gradient accumulation with the 4090-safe microbatch:
+
+```bash
+WANDB_MODE=offline \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+PYTHONPATH=/home/xiaol/X/LT2_upstream \
+.venv/bin/python -m torch.distributed.run --nproc_per_node=1 pretrain.py \
+  arch/net@arch=hrm_rwkv7 \
+  arch/size@arch=L \
+  data.path=/home/xiaol/X/hrm_text_subset_1B \
+  global_batch_size=172032 \
+  micro_batch_size=1024 \
+  epochs=1 \
+  compile_train=false \
+  arch.rwkv7_backend=cuda \
+  run_name=hrm_rwkv7_l_1b_subset_b172k_micro1024
+```
+
+That gives `172032 / 1024 = 168` gradient-accumulation microsteps per optimizer step on one 4090.
+
 ## Speed Notes
 
 The first RWKV implementation looped over PrefixLM-packed sequences one by one, which caused many tiny kernel launches. `RWKV7Stack` now pads packed `[T, C]` batches into `[numseqs, max_seq_len, C]`, runs the RWKV stack once, and scatters back to `[T, C]`.
