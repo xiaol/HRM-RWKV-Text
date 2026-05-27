@@ -78,13 +78,19 @@ class V1Dataset(IterableDataset):
                 self._data = np.load(tokens_npy_path, mmap_mode="r")
 
         # Load indices
-        self._data_indices = V1DatasetIndices(**{f.name: np.load(os.path.join(self.config.dataset_path, f"epoch_{self._epoch}", f"{f.name}.npy"), mmap_mode="r")
+        epoch_path = os.path.join(self.config.dataset_path, f"epoch_{self._epoch}")
+        self._data_indices = V1DatasetIndices(**{f.name: np.load(os.path.join(epoch_path, f"{f.name}.npy"), mmap_mode="r")
                                                  for f in fields(V1DatasetIndices)})
+        length_path = os.path.join(epoch_path, "length.npy")
+        if os.path.exists(length_path):
+            lengths = np.load(length_path, mmap_mode="r")
+        else:
+            lengths = self._data_indices.inst_len + self._data_indices.resp_len - 1
         self._epoch += 1
 
         # Re-create sampler
         self._sampler = MultipackDistributedBatchSampler(
-            lengths=self._data_indices.inst_len + self._data_indices.resp_len - 1,  # Account for autoregressive shift
+            lengths=lengths,  # Account for autoregressive shift
             batch_max_length=self.config.batch_max_length,
             drop_last_batch=self.config.drop_last_batch,
 

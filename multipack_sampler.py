@@ -149,6 +149,7 @@ class MultipackDistributedBatchSampler(Sampler):
         # statistics
         self.eff_total_used = 0
         self.eff_total_slots = 0
+        self.skipped_oversized = 0
 
     def iter(self):
         # Allocate workspace
@@ -156,6 +157,12 @@ class MultipackDistributedBatchSampler(Sampler):
 
         start_index = 0
         while start_index < self.lengths.size:
+            while start_index < self.lengths.size and self.lengths[start_index] > self.batch_max_length:
+                self.skipped_oversized += 1
+                start_index += 1
+            if start_index >= self.lengths.size:
+                break
+
             is_full, global_numseq, batch, batch_totlen = allocate(heap,
                                                                    start_index, self.lengths,
                                                                    rank=self.rank, c=self.batch_max_length, n=self.num_replicas)

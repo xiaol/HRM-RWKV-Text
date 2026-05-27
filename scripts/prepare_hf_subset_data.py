@@ -4,14 +4,15 @@ It accepts rows with `instruction`, `response`, and optional `condition`,
 tokenizes them, and writes the same dataset structure used by `dataset_new.py`.
 Rows can come from Hugging Face streaming, a single JSONL file, or a local raw
 HRM-Text snapshot containing JSONL/parquet files. Use `--compact-uint16` with
-vocabularies up to 65536 to halve token storage versus `tokens.npy`.
+vocabularies up to 65536 to halve token storage versus int32 tokens.
 """
 
 from __future__ import annotations
 
 import argparse
-from array import array
+import hashlib
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -19,6 +20,9 @@ from typing import Iterable, Sequence
 
 import numpy as np
 from tokenizers import Tokenizer
+
+
+INDEX_FIELDS = ("inst_start", "inst_len", "resp_start", "resp_len")
 
 
 def iter_jsonl(path: Path) -> Iterable[dict]:
@@ -56,26 +60,32 @@ def iter_parquet_batches(path: Path, columns: Sequence[str], batch_size: int) ->
         yield [{key: values[idx] for key, values in rows.items()} for idx in range(row_count)]
 
 
-def iter_local_snapshot(
-    root: Path,
-    patterns: Sequence[str],
-    columns: Sequence[str],
-    parquet_batch_size: int,
-) -> Iterable[tuple[Path, list[dict]]]:
+def list_local_snapshot_files(root: Path, patterns: Sequence[str]) -> list[Path]:
     files: list[Path] = []
     for pattern in patterns:
         files.extend(root.glob(pattern))
     files = sorted({path for path in files if path.is_file()})
     if not files:
         raise FileNotFoundError(f"No local files matched {patterns} under {root}")
+    return files
 
-    for path in files:
-        if path.suffix == ".jsonl":
-            for batch in iter_jsonl_batches(path, parquet_batch_size):
-                yield path, batch
-        elif path.suffix == ".parquet":
-            for batch in iter_parquet_batches(path, columns=columns, batch_size=parquet_batch_size):
-                yield path, batch
+
+def iter_local_snapshot(
+    root: Path,
+    patterns: Sequence[str],
+    columns: Sequence[str],
+    parquet_batch_size: int,
+) -> Iterable[tuple[Path, list[dict]]]:
+    for path in list_local_snapshot_files(root, patterns):
+        for batch in iter_file_batches(path, columns, parquet_batch_size):
+            yield path, batch
+
+
+def iter_file_batches(path: Path, columns: Sequence[str], batch_size: int) -> Iterable[list[dict]]:
+    if path.suffix == ".jsonl":
+        yield from iter_jsonl_batches(path, batch_size)
+    elif path.suffix == ".parquet":
+        yield from iter_parquet_batches(path, columns=columns, batch_size=batch_size)
 
 
 def iter_hf_rows(dataset: str, name: str, split: str, streaming: bool) -> Iterable[dict]:
@@ -100,6 +110,81 @@ def parse_condition_tokens(raw: str) -> tuple[dict[str, str], dict[str, int]]:
     return token_by_condition, {}
 
 
+def source_fingerprint(files: Sequence[Path], root: Path | None) -> str:
+    digest = hashlib.sha256()
+    for path in files:
+        rel = path.relative_to(root) if root is not None else path
+        stat = path.stat()
+        digest.update(str(rel).encode())
+        digest.update(b"\0")
+        digest.update(str(stat.st_size).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def truncate_file(path: Path, size: int) -> None:
+    if path.exists():
+        with path.open("ab") as f:
+            f.truncate(size)
+
+
+def copy_raw_index_to_npy(src_path: Path, dst_path: Path, rows: int, chunk_rows: int) -> None:
+    src = np.memmap(src_path, mode="r", dtype=np.int64, shape=(rows,))
+    dst = np.lib.format.open_memmap(dst_path, mode="w+", dtype=np.int64, shape=(rows,))
+    for start in range(0, rows, chunk_rows):
+        end = min(start + chunk_rows, rows)
+        dst[start:end] = src[start:end]
+    dst.flush()
+    del dst
+    del src
+
+
+def copy_raw_index_to_shuffled_npy(src_path: Path, dst_path: Path, perm: np.ndarray, chunk_rows: int) -> None:
+    rows = int(perm.shape[0])
+    src = np.memmap(src_path, mode="r", dtype=np.int64, shape=(rows,))
+    dst = np.lib.format.open_memmap(dst_path, mode="w+", dtype=np.int64, shape=(rows,))
+    for start in range(0, rows, chunk_rows):
+        end = min(start + chunk_rows, rows)
+        dst[start:end] = src[perm[start:end]]
+    dst.flush()
+    del dst
+    del src
+
+
+def write_length_npy(
+    inst_len_path: Path,
+    resp_len_path: Path,
+    dst_path: Path,
+    rows: int,
+    chunk_rows: int,
+    perm: np.ndarray | None = None,
+) -> None:
+    inst_len = np.memmap(inst_len_path, mode="r", dtype=np.int64, shape=(rows,))
+    resp_len = np.memmap(resp_len_path, mode="r", dtype=np.int64, shape=(rows,))
+    dst = np.lib.format.open_memmap(dst_path, mode="w+", dtype=np.int64, shape=(rows,))
+    for start in range(0, rows, chunk_rows):
+        end = min(start + chunk_rows, rows)
+        if perm is None:
+            dst[start:end] = inst_len[start:end] + resp_len[start:end] - 1
+        else:
+            idx = perm[start:end]
+            dst[start:end] = inst_len[idx] + resp_len[idx] - 1
+    dst.flush()
+    del dst
+    del resp_len
+    del inst_len
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare a streamed subset in HRM-Text V1Dataset format.")
     parser.add_argument("--hf-dataset", default="sapientinc/HRM-Text-data-io-cleaned-20260515")
@@ -107,11 +192,22 @@ def main() -> None:
     parser.add_argument("--split", default="train")
     parser.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--local-jsonl", default="")
-    parser.add_argument("--local-root", default="", help="Local raw HRM-Text snapshot root containing data/**/*.jsonl and data_clustered/**/*.parquet")
+    parser.add_argument(
+        "--local-root",
+        default="",
+        help="Local raw HRM-Text snapshot root containing data/**/*.jsonl and data_clustered/**/*.parquet",
+    )
     parser.add_argument("--local-patterns", default="data/**/*.jsonl,data_clustered/**/*.parquet")
     parser.add_argument("--parquet-batch-size", type=int, default=8192)
+    parser.add_argument("--tokenizer-batch-size", type=int, default=4096)
     parser.add_argument("--tokenizer", required=True, help="Tokenizer JSON path.")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--overwrite", action="store_true", help="Delete an existing output directory before writing.")
+    parser.add_argument("--keep-build-files", action="store_true", help="Keep resumable raw index files after finalization.")
+    parser.add_argument("--shuffle-index", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--index-copy-chunk-rows", type=int, default=1_000_000)
+    parser.add_argument("--max-in-memory-shuffle-rows", type=int, default=20_000_000)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--context-size", type=int, default=4097)
@@ -133,8 +229,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.resume and args.overwrite:
+        raise ValueError("--resume and --overwrite are mutually exclusive")
+    if args.tokenizer_batch_size <= 0:
+        raise ValueError("--tokenizer-batch-size must be positive")
+
     out_dir = Path(args.output)
+    if args.overwrite and out_dir.exists():
+        shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    build_dir = out_dir / "_prepare"
+    build_dir.mkdir(exist_ok=True)
 
     tokenizer = Tokenizer.from_file(args.tokenizer)
 
@@ -154,14 +259,11 @@ def main() -> None:
         raise ValueError(f"vocab_size={vocab_size} does not fit compact uint16 tokens")
 
     token_dtype = np.uint16 if args.compact_uint16 else np.int32
-    tokens_path = out_dir / ("tokens.bin" if args.compact_uint16 else "tokens.npy")
-    token_writer = tokens_path.open("wb") if args.compact_uint16 else None
-    tokens_array: list[int] = []
+    token_itemsize = np.dtype(token_dtype).itemsize
+    tokens_path = out_dir / "tokens.bin"
+    index_paths = {field: build_dir / f"{field}.bin" for field in INDEX_FIELDS}
+    checkpoint_path = out_dir / "prepare_checkpoint.json"
 
-    inst_start = array("q")
-    inst_len = array("q")
-    resp_start = array("q")
-    resp_len = array("q")
     total_tokens = 0
     kept_rows = 0
     skipped_rows = 0
@@ -177,15 +279,175 @@ def main() -> None:
     if sources > 1:
         raise ValueError("Use only one local source: --local-jsonl or --local-root")
 
+    source_files: list[Path] = []
+    source_root: Path | None = None
     if args.local_jsonl:
-        rows = ((Path(args.local_jsonl), batch) for batch in iter_jsonl_batches(Path(args.local_jsonl), args.parquet_batch_size))
+        source_files = [Path(args.local_jsonl)]
     elif args.local_root:
-        rows = iter_local_snapshot(
-            Path(args.local_root),
-            patterns=local_patterns,
-            columns=requested_columns,
-            parquet_batch_size=args.parquet_batch_size,
+        source_root = Path(args.local_root)
+        source_files = list_local_snapshot_files(source_root, local_patterns)
+
+    signature = {
+        "version": 2,
+        "tokenizer": str(Path(args.tokenizer).resolve()),
+        "context_size": args.context_size,
+        "compact_uint16": args.compact_uint16,
+        "token_dtype": np.dtype(token_dtype).name,
+        "instruction_fields": instruction_fields,
+        "response_fields": response_fields,
+        "condition_fields": condition_fields,
+        "default_condition": args.default_condition,
+        "boq": args.boq,
+        "eoq": args.eoq,
+        "eoa": args.eoa,
+        "conditions": condition_tokens,
+        "vocab_size": vocab_size,
+        "source_kind": "local_jsonl" if args.local_jsonl else "local_root" if args.local_root else "hf",
+        "local_root": str(source_root.resolve()) if source_root is not None else "",
+        "local_patterns": local_patterns,
+        "source_count": len(source_files),
+        "source_fingerprint": source_fingerprint(source_files, source_root) if source_files else "",
+        "hf_dataset": args.hf_dataset,
+        "hf_name": args.hf_name,
+        "split": args.split,
+    }
+
+    resume_next_file_index = 0
+    loaded_checkpoint = False
+    partial_paths = [tokens_path, checkpoint_path, *index_paths.values(), out_dir / "metadata.json", out_dir / "epoch_0"]
+    if args.resume:
+        if checkpoint_path.exists():
+            checkpoint = json.loads(checkpoint_path.read_text())
+            if checkpoint.get("signature") != signature:
+                raise ValueError("Checkpoint signature does not match this preparation command")
+            resume_next_file_index = int(checkpoint["next_file_index"])
+            total_tokens = int(checkpoint["total_tokens"])
+            kept_rows = int(checkpoint["kept_rows"])
+            skipped_rows = int(checkpoint["skipped_rows"])
+            max_sample_len = int(checkpoint["max_sample_len"])
+            truncate_file(tokens_path, total_tokens * token_itemsize)
+            for path in index_paths.values():
+                truncate_file(path, kept_rows * np.dtype(np.int64).itemsize)
+            loaded_checkpoint = True
+            print(
+                f"resuming next_file_index={resume_next_file_index} rows={kept_rows:,} "
+                f"tokens={total_tokens:,} skipped={skipped_rows:,}",
+                flush=True,
+            )
+        elif any(path.exists() for path in partial_paths):
+            raise ValueError(f"{out_dir} has partial data but no checkpoint; pass --overwrite to restart")
+    elif any(path.exists() for path in partial_paths) and not args.overwrite:
+        raise ValueError(f"{out_dir} already contains prepared data; pass --overwrite or --resume")
+
+    token_writer = tokens_path.open("ab" if loaded_checkpoint else "wb")
+    index_writers = {field: index_paths[field].open("ab" if loaded_checkpoint else "wb") for field in INDEX_FIELDS}
+
+    def write_ids(ids: list[int]) -> None:
+        nonlocal total_tokens
+        np.asarray(ids, dtype=token_dtype).tofile(token_writer)
+        total_tokens += len(ids)
+
+    def write_index_chunk(values: dict[str, list[int]]) -> None:
+        for field in INDEX_FIELDS:
+            np.asarray(values[field], dtype=np.int64).tofile(index_writers[field])
+
+    def condition_to_ids(raw_condition) -> list[int]:
+        parts = [part.strip() for part in str(raw_condition or "").split(",") if part.strip()]
+        ids = [condition_ids[part] for part in parts if part in condition_ids]
+        if not ids:
+            ids = [condition_ids[args.default_condition]]
+        return ids
+
+    def checkpoint(next_file_index: int) -> None:
+        token_writer.flush()
+        os.fsync(token_writer.fileno())
+        for writer in index_writers.values():
+            writer.flush()
+            os.fsync(writer.fileno())
+        atomic_write_json(
+            checkpoint_path,
+            {
+                "signature": signature,
+                "next_file_index": next_file_index,
+                "total_tokens": total_tokens,
+                "kept_rows": kept_rows,
+                "skipped_rows": skipped_rows,
+                "max_sample_len": max_sample_len,
+                "updated_at": time.time(),
+            },
         )
+
+    def should_stop() -> bool:
+        return (args.max_rows > 0 and kept_rows >= args.max_rows) or (
+            args.target_tokens > 0 and total_tokens >= args.target_tokens
+        )
+
+    def process_row_batch(row_batch: list[dict]) -> bool:
+        nonlocal kept_rows, skipped_rows, max_sample_len
+        for start in range(0, len(row_batch), args.tokenizer_batch_size):
+            row_chunk = row_batch[start : start + args.tokenizer_batch_size]
+            instructions: list[str] = []
+            responses: list[str] = []
+            batch_condition_ids: list[list[int]] = []
+            for row in row_chunk:
+                instruction = first_present(row, instruction_fields)
+                response = first_present(row, response_fields)
+                if not instruction or not response:
+                    skipped_rows += 1
+                    continue
+                condition = first_present(row, condition_fields) or args.default_condition
+                instructions.append(str(instruction))
+                responses.append(str(response))
+                batch_condition_ids.append(condition_to_ids(condition))
+
+            if not instructions:
+                continue
+
+            encoded_inst = tokenizer.encode_batch(instructions, add_special_tokens=False)
+            encoded_resp = tokenizer.encode_batch(responses, add_special_tokens=False)
+            index_values = {field: [] for field in INDEX_FIELDS}
+
+            for inst_encoding, resp_encoding, condition_token_ids in zip(encoded_inst, encoded_resp, batch_condition_ids):
+                inst_ids = inst_encoding.ids
+                resp_ids = resp_encoding.ids
+                sample = [boq_id, *condition_token_ids, *inst_ids, eoq_id, *resp_ids, eoa_id]
+                if len(sample) >= args.context_size:
+                    skipped_rows += 1
+                    continue
+
+                i_start = total_tokens
+                prefix_len = 1 + len(condition_token_ids) + len(inst_ids) + 1
+                r_start = i_start + prefix_len
+                write_ids(sample)
+                index_values["inst_start"].append(i_start)
+                index_values["inst_len"].append(r_start - i_start)
+                index_values["resp_start"].append(r_start)
+                index_values["resp_len"].append(len(resp_ids) + 1)
+                kept_rows += 1
+                max_sample_len = max(max_sample_len, len(sample))
+
+                if args.log_every > 0 and kept_rows % args.log_every == 0:
+                    print(f"rows={kept_rows:,} tokens={total_tokens:,} skipped={skipped_rows:,}", flush=True)
+                if should_stop():
+                    break
+
+            if index_values["inst_start"]:
+                write_index_chunk(index_values)
+            if should_stop():
+                return True
+        return False
+
+    stopped = False
+    if source_files:
+        for file_index, source_path in enumerate(source_files[resume_next_file_index:], start=resume_next_file_index):
+            print(f"source={source_path}", flush=True)
+            for row_batch in iter_file_batches(source_path, requested_columns, args.parquet_batch_size):
+                stopped = process_row_batch(row_batch)
+                if stopped:
+                    break
+            if stopped:
+                break
+            checkpoint(file_index + 1)
     else:
         def iter_hf_batches() -> Iterable[tuple[Path, list[dict]]]:
             batch = []
@@ -197,107 +459,25 @@ def main() -> None:
             if batch:
                 yield Path(args.hf_dataset), batch
 
-        rows = iter_hf_batches()
-
-    def write_ids(ids: list[int]) -> None:
-        nonlocal total_tokens
-        if args.compact_uint16:
-            np.asarray(ids, dtype=token_dtype).tofile(token_writer)
-        else:
-            tokens_array.extend(ids)
-        total_tokens += len(ids)
-
-    def condition_to_ids(raw_condition) -> list[int]:
-        parts = [part.strip() for part in str(raw_condition or "").split(",") if part.strip()]
-        ids = [condition_ids[part] for part in parts if part in condition_ids]
-        if not ids:
-            ids = [condition_ids[args.default_condition]]
-        return ids
-
-    row_iter = iter(rows)
-    current_source: Path | None = None
-    while True:
-        try:
-            source_path, row_batch = next(row_iter)
-            if source_path != current_source:
-                current_source = source_path
+        row_iter = iter(iter_hf_batches())
+        while True:
+            try:
+                source_path, row_batch = next(row_iter)
                 print(f"source={source_path}", flush=True)
-        except StopIteration:
-            break
-        except Exception as exc:
-            if args.local_jsonl or args.local_root:
-                raise
-            print(f"stream read failed: {type(exc).__name__}: {exc}; retrying in {args.retry_wait}s", flush=True)
-            time.sleep(args.retry_wait)
-            def retry_hf_batches() -> Iterable[tuple[Path, list[dict]]]:
-                batch = []
-                for row in iter_hf_rows(args.hf_dataset, args.hf_name, args.split, args.streaming):
-                    batch.append(row)
-                    if len(batch) >= args.parquet_batch_size:
-                        yield Path(args.hf_dataset), batch
-                        batch = []
-                if batch:
-                    yield Path(args.hf_dataset), batch
-
-            rows = retry_hf_batches()
-            row_iter = iter(rows)
-            continue
-
-        instructions: list[str] = []
-        responses: list[str] = []
-        batch_condition_ids: list[list[int]] = []
-        for row in row_batch:
-            instruction = first_present(row, instruction_fields)
-            response = first_present(row, response_fields)
-            if not instruction or not response:
-                skipped_rows += 1
-                continue
-            condition = first_present(row, condition_fields) or args.default_condition
-            instructions.append(str(instruction))
-            responses.append(str(response))
-            batch_condition_ids.append(condition_to_ids(condition))
-
-        if not instructions:
-            continue
-
-        encoded_inst = tokenizer.encode_batch(instructions, add_special_tokens=False)
-        encoded_resp = tokenizer.encode_batch(responses, add_special_tokens=False)
-
-        for inst_encoding, resp_encoding, condition_token_ids in zip(encoded_inst, encoded_resp, batch_condition_ids):
-            inst_ids = inst_encoding.ids
-            resp_ids = resp_encoding.ids
-            sample = [boq_id, *condition_token_ids, *inst_ids, eoq_id, *resp_ids, eoa_id]
-            if len(sample) >= args.context_size:
-                skipped_rows += 1
-                continue
-
-            i_start = total_tokens
-            prefix_len = 1 + len(condition_token_ids) + len(inst_ids) + 1
-            r_start = i_start + prefix_len
-            write_ids(sample)
-            inst_start.append(i_start)
-            inst_len.append(r_start - i_start)
-            resp_start.append(r_start)
-            resp_len.append(len(resp_ids) + 1)
-            kept_rows += 1
-            max_sample_len = max(max_sample_len, len(sample))
-
-            if args.log_every > 0 and kept_rows % args.log_every == 0:
-                print(f"rows={kept_rows:,} tokens={total_tokens:,} skipped={skipped_rows:,}", flush=True)
-            if args.max_rows > 0 and kept_rows >= args.max_rows:
+            except StopIteration:
                 break
-            if args.target_tokens > 0 and total_tokens >= args.target_tokens:
+            except Exception as exc:
+                print(f"stream read failed: {type(exc).__name__}: {exc}; retrying in {args.retry_wait}s", flush=True)
+                time.sleep(args.retry_wait)
+                row_iter = iter(iter_hf_batches())
+                continue
+            stopped = process_row_batch(row_batch)
+            if stopped:
                 break
 
-        if args.max_rows > 0 and kept_rows >= args.max_rows:
-            break
-        if args.target_tokens > 0 and total_tokens >= args.target_tokens:
-            break
-
-    if token_writer is not None:
-        token_writer.close()
-    else:
-        np.save(tokens_path, np.asarray(tokens_array, dtype=token_dtype))
+    token_writer.close()
+    for writer in index_writers.values():
+        writer.close()
 
     if kept_rows == 0:
         raise ValueError("No rows were written")
@@ -313,32 +493,55 @@ def main() -> None:
         "vocab_size": vocab_size,
     }
     (out_dir / "tokenizer_info.json").write_text(json.dumps(tokenizer_info) + "\n")
-    (out_dir / "metadata.json").write_text(
-        json.dumps(
-            {
-                "tokenizer_info": tokenizer_info,
-                "vocab_size": None,
-                "max_seq_len": args.context_size,
-                "total_length": int(total_tokens),
-                "token_dtype": np.dtype(token_dtype).name,
-            }
-        )
-        + "\n"
-    )
 
-    inst_start_np = np.frombuffer(inst_start, dtype=np.int64)
-    inst_len_np = np.frombuffer(inst_len, dtype=np.int64)
-    resp_start_np = np.frombuffer(resp_start, dtype=np.int64)
-    resp_len_np = np.frombuffer(resp_len, dtype=np.int64)
     rng = np.random.Generator(np.random.Philox(seed=args.seed))
     for epoch in range(args.epochs):
-        perm = rng.permutation(len(inst_start_np))
         ep_dir = out_dir / f"epoch_{epoch}"
+        if ep_dir.exists():
+            shutil.rmtree(ep_dir)
         ep_dir.mkdir(exist_ok=True)
-        np.save(ep_dir / "inst_start.npy", inst_start_np[perm])
-        np.save(ep_dir / "inst_len.npy", inst_len_np[perm])
-        np.save(ep_dir / "resp_start.npy", resp_start_np[perm])
-        np.save(ep_dir / "resp_len.npy", resp_len_np[perm])
+        if args.shuffle_index:
+            if kept_rows > args.max_in_memory_shuffle_rows:
+                raise ValueError(
+                    f"--shuffle-index needs a {kept_rows:,}-row permutation in RAM; "
+                    "use --no-shuffle-index for large local snapshots"
+                )
+            perm = rng.permutation(kept_rows)
+            for field, src_path in index_paths.items():
+                copy_raw_index_to_shuffled_npy(src_path, ep_dir / f"{field}.npy", perm, args.index_copy_chunk_rows)
+            write_length_npy(
+                index_paths["inst_len"],
+                index_paths["resp_len"],
+                ep_dir / "length.npy",
+                kept_rows,
+                args.index_copy_chunk_rows,
+                perm=perm,
+            )
+        else:
+            for field, src_path in index_paths.items():
+                copy_raw_index_to_npy(src_path, ep_dir / f"{field}.npy", kept_rows, args.index_copy_chunk_rows)
+            write_length_npy(
+                index_paths["inst_len"],
+                index_paths["resp_len"],
+                ep_dir / "length.npy",
+                kept_rows,
+                args.index_copy_chunk_rows,
+            )
+
+    atomic_write_json(
+        out_dir / "metadata.json",
+        {
+            "tokenizer_info": tokenizer_info,
+            "vocab_size": None,
+            "max_seq_len": args.context_size,
+            "total_length": int(total_tokens),
+            "token_dtype": np.dtype(token_dtype).name,
+        },
+    )
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+    if not args.keep_build_files:
+        shutil.rmtree(build_dir)
 
     print(
         f"wrote rows={kept_rows:,} skipped={skipped_rows:,} tokens={total_tokens:,} "
