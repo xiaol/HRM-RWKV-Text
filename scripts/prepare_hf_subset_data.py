@@ -248,6 +248,7 @@ def main() -> None:
     parser.add_argument("--parquet-batch-size", type=int, default=8192)
     parser.add_argument("--tokenizer-batch-size", type=int, default=4096)
     parser.add_argument("--gc-every-files", type=int, default=1)
+    parser.add_argument("--gc-every-batches", type=int, default=0)
     parser.add_argument("--malloc-trim", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tokenizer", required=True, help="Tokenizer JSON path.")
@@ -509,9 +510,15 @@ def main() -> None:
     if source_files:
         for file_index, source_path in enumerate(source_files[resume_next_file_index:], start=resume_next_file_index):
             print(f"source={source_path}", flush=True)
-            for row_batch in iter_file_batches(source_path, requested_columns, args.parquet_batch_size):
+            for batch_index, row_batch in enumerate(iter_file_batches(source_path, requested_columns, args.parquet_batch_size), start=1):
                 stopped = process_row_batch(row_batch)
                 del row_batch
+                if args.gc_every_batches > 0 and batch_index % args.gc_every_batches == 0:
+                    release_unused_memory(args.malloc_trim)
+                    if args.log_memory:
+                        rss_mb = current_rss_mb()
+                        if rss_mb is not None:
+                            print(f"rss_mb={rss_mb:,} file_index={file_index} batch_index={batch_index}", flush=True)
                 if stopped:
                     break
             if stopped:
