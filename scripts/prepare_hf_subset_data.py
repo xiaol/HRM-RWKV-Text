@@ -10,6 +10,8 @@ vocabularies up to 65536 to halve token storage versus int32 tokens.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import gc
 import hashlib
 import json
 import os
@@ -23,6 +25,43 @@ from tokenizers import Tokenizer
 
 
 INDEX_FIELDS = ("inst_start", "inst_len", "resp_start", "resp_len")
+_LIBC = None
+
+
+def current_rss_mb() -> int | None:
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        return None
+    return None
+
+
+def release_unused_memory(trim_malloc: bool) -> None:
+    gc.collect()
+    try:
+        import pyarrow as pa
+
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+
+    if not trim_malloc:
+        return
+
+    global _LIBC
+    if _LIBC is None:
+        try:
+            _LIBC = ctypes.CDLL("libc.so.6")
+        except OSError:
+            _LIBC = False
+    if _LIBC:
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:
+            pass
 
 
 def iter_jsonl(path: Path) -> Iterable[dict]:
@@ -43,7 +82,7 @@ def iter_jsonl_batches(path: Path, batch_size: int) -> Iterable[list[dict]]:
         yield batch
 
 
-def iter_parquet_batches(path: Path, columns: Sequence[str], batch_size: int) -> Iterable[list[dict]]:
+def iter_parquet_batches(path: Path, columns: Sequence[str], batch_size: int) -> Iterable[dict[str, list]]:
     import pyarrow.parquet as pq
 
     parquet_file = pq.ParquetFile(path)
@@ -56,8 +95,7 @@ def iter_parquet_batches(path: Path, columns: Sequence[str], batch_size: int) ->
         rows = batch.to_pydict()
         if not rows:
             continue
-        row_count = len(next(iter(rows.values())))
-        yield [{key: values[idx] for key, values in rows.items()} for idx in range(row_count)]
+        yield rows
 
 
 def list_local_snapshot_files(root: Path, patterns: Sequence[str]) -> list[Path]:
@@ -81,7 +119,7 @@ def iter_local_snapshot(
             yield path, batch
 
 
-def iter_file_batches(path: Path, columns: Sequence[str], batch_size: int) -> Iterable[list[dict]]:
+def iter_file_batches(path: Path, columns: Sequence[str], batch_size: int) -> Iterable[list[dict] | dict[str, list]]:
     if path.suffix == ".jsonl":
         yield from iter_jsonl_batches(path, batch_size)
     elif path.suffix == ".parquet":
@@ -99,6 +137,15 @@ def first_present(row: dict, names: list[str]):
     for name in names:
         if name in row and row[name] is not None:
             return row[name]
+    return None
+
+
+def first_present_column(columns: dict[str, list], row_index: int, names: list[str]):
+    for name in names:
+        if name in columns:
+            value = columns[name][row_index]
+            if value is not None:
+                return value
     return None
 
 
@@ -200,6 +247,9 @@ def main() -> None:
     parser.add_argument("--local-patterns", default="data/**/*.jsonl,data_clustered/**/*.parquet")
     parser.add_argument("--parquet-batch-size", type=int, default=8192)
     parser.add_argument("--tokenizer-batch-size", type=int, default=4096)
+    parser.add_argument("--gc-every-files", type=int, default=1)
+    parser.add_argument("--malloc-trim", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--log-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tokenizer", required=True, help="Tokenizer JSON path.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=False)
@@ -382,20 +432,29 @@ def main() -> None:
             args.target_tokens > 0 and total_tokens >= args.target_tokens
         )
 
-    def process_row_batch(row_batch: list[dict]) -> bool:
+    def process_row_batch(row_batch: list[dict] | dict[str, list]) -> bool:
         nonlocal kept_rows, skipped_rows, max_sample_len
-        for start in range(0, len(row_batch), args.tokenizer_batch_size):
-            row_chunk = row_batch[start : start + args.tokenizer_batch_size]
+        row_count = len(next(iter(row_batch.values()))) if isinstance(row_batch, dict) else len(row_batch)
+        for start in range(0, row_count, args.tokenizer_batch_size):
+            end = min(start + args.tokenizer_batch_size, row_count)
             instructions: list[str] = []
             responses: list[str] = []
             batch_condition_ids: list[list[int]] = []
-            for row in row_chunk:
-                instruction = first_present(row, instruction_fields)
-                response = first_present(row, response_fields)
+            for row_idx in range(start, end):
+                if isinstance(row_batch, dict):
+                    instruction = first_present_column(row_batch, row_idx, instruction_fields)
+                    response = first_present_column(row_batch, row_idx, response_fields)
+                else:
+                    row = row_batch[row_idx]
+                    instruction = first_present(row, instruction_fields)
+                    response = first_present(row, response_fields)
                 if not instruction or not response:
                     skipped_rows += 1
                     continue
-                condition = first_present(row, condition_fields) or args.default_condition
+                if isinstance(row_batch, dict):
+                    condition = first_present_column(row_batch, row_idx, condition_fields) or args.default_condition
+                else:
+                    condition = first_present(row, condition_fields) or args.default_condition
                 instructions.append(str(instruction))
                 responses.append(str(response))
                 batch_condition_ids.append(condition_to_ids(condition))
@@ -437,17 +496,28 @@ def main() -> None:
                 return True
         return False
 
+    def maybe_release_memory(files_done: int) -> None:
+        if args.gc_every_files <= 0 or files_done % args.gc_every_files != 0:
+            return
+        release_unused_memory(args.malloc_trim)
+        if args.log_memory:
+            rss_mb = current_rss_mb()
+            if rss_mb is not None:
+                print(f"rss_mb={rss_mb:,} files_done={files_done}", flush=True)
+
     stopped = False
     if source_files:
         for file_index, source_path in enumerate(source_files[resume_next_file_index:], start=resume_next_file_index):
             print(f"source={source_path}", flush=True)
             for row_batch in iter_file_batches(source_path, requested_columns, args.parquet_batch_size):
                 stopped = process_row_batch(row_batch)
+                del row_batch
                 if stopped:
                     break
             if stopped:
                 break
             checkpoint(file_index + 1)
+            maybe_release_memory(file_index + 1)
     else:
         def iter_hf_batches() -> Iterable[tuple[Path, list[dict]]]:
             batch = []
