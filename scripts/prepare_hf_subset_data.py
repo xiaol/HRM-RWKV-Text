@@ -395,6 +395,8 @@ def main() -> None:
 
     def write_ids(ids: list[int]) -> None:
         nonlocal total_tokens
+        if not ids:
+            return
         np.asarray(ids, dtype=token_dtype).tofile(token_writer)
         total_tokens += len(ids)
 
@@ -466,31 +468,41 @@ def main() -> None:
             encoded_inst = tokenizer.encode_batch(instructions, add_special_tokens=False)
             encoded_resp = tokenizer.encode_batch(responses, add_special_tokens=False)
             index_values = {field: [] for field in INDEX_FIELDS}
+            token_values: list[int] = []
 
             for inst_encoding, resp_encoding, condition_token_ids in zip(encoded_inst, encoded_resp, batch_condition_ids):
                 inst_ids = inst_encoding.ids
                 resp_ids = resp_encoding.ids
-                sample = [boq_id, *condition_token_ids, *inst_ids, eoq_id, *resp_ids, eoa_id]
-                if len(sample) >= args.context_size:
+                sample_len = 1 + len(condition_token_ids) + len(inst_ids) + 1 + len(resp_ids) + 1
+                if sample_len >= args.context_size:
                     skipped_rows += 1
                     continue
 
-                i_start = total_tokens
+                i_start = total_tokens + len(token_values)
                 prefix_len = 1 + len(condition_token_ids) + len(inst_ids) + 1
                 r_start = i_start + prefix_len
-                write_ids(sample)
+                token_values.append(boq_id)
+                token_values.extend(condition_token_ids)
+                token_values.extend(inst_ids)
+                token_values.append(eoq_id)
+                token_values.extend(resp_ids)
+                token_values.append(eoa_id)
                 index_values["inst_start"].append(i_start)
                 index_values["inst_len"].append(r_start - i_start)
                 index_values["resp_start"].append(r_start)
                 index_values["resp_len"].append(len(resp_ids) + 1)
                 kept_rows += 1
-                max_sample_len = max(max_sample_len, len(sample))
+                max_sample_len = max(max_sample_len, sample_len)
 
                 if args.log_every > 0 and kept_rows % args.log_every == 0:
-                    print(f"rows={kept_rows:,} tokens={total_tokens:,} skipped={skipped_rows:,}", flush=True)
-                if should_stop():
+                    pending_tokens = total_tokens + len(token_values)
+                    print(f"rows={kept_rows:,} tokens={pending_tokens:,} skipped={skipped_rows:,}", flush=True)
+                if (args.max_rows > 0 and kept_rows >= args.max_rows) or (
+                    args.target_tokens > 0 and total_tokens + len(token_values) >= args.target_tokens
+                ):
                     break
 
+            write_ids(token_values)
             if index_values["inst_start"]:
                 write_index_chunk(index_values)
             if should_stop():
