@@ -404,11 +404,19 @@ def main() -> None:
         for field in INDEX_FIELDS:
             np.asarray(values[field], dtype=np.int64).tofile(index_writers[field])
 
+    condition_id_cache: dict[str, list[int]] = {}
+
     def condition_to_ids(raw_condition) -> list[int]:
-        parts = [part.strip() for part in str(raw_condition or "").split(",") if part.strip()]
+        cache_key = str(raw_condition or "")
+        cached_ids = condition_id_cache.get(cache_key)
+        if cached_ids is not None:
+            return cached_ids
+
+        parts = [part.strip() for part in cache_key.split(",") if part.strip()]
         ids = [condition_ids[part] for part in parts if part in condition_ids]
         if not ids:
             ids = [condition_ids[args.default_condition]]
+        condition_id_cache[cache_key] = ids
         return ids
 
     def checkpoint(next_file_index: int) -> None:
@@ -437,16 +445,28 @@ def main() -> None:
 
     def process_row_batch(row_batch: list[dict] | dict[str, list]) -> bool:
         nonlocal kept_rows, skipped_rows, max_sample_len
-        row_count = len(next(iter(row_batch.values()))) if isinstance(row_batch, dict) else len(row_batch)
+        is_column_batch = isinstance(row_batch, dict)
+        row_count = len(next(iter(row_batch.values()))) if is_column_batch else len(row_batch)
+        inst_col = None
+        resp_col = None
+        cond_col = None
+        if is_column_batch:
+            if len(instruction_fields) == 1:
+                inst_col = row_batch.get(instruction_fields[0])
+            if len(response_fields) == 1:
+                resp_col = row_batch.get(response_fields[0])
+            if len(condition_fields) == 1:
+                cond_col = row_batch.get(condition_fields[0])
+
         for start in range(0, row_count, args.tokenizer_batch_size):
             end = min(start + args.tokenizer_batch_size, row_count)
             instructions: list[str] = []
             responses: list[str] = []
             batch_condition_ids: list[list[int]] = []
             for row_idx in range(start, end):
-                if isinstance(row_batch, dict):
-                    instruction = first_present_column(row_batch, row_idx, instruction_fields)
-                    response = first_present_column(row_batch, row_idx, response_fields)
+                if is_column_batch:
+                    instruction = inst_col[row_idx] if inst_col is not None else first_present_column(row_batch, row_idx, instruction_fields)
+                    response = resp_col[row_idx] if resp_col is not None else first_present_column(row_batch, row_idx, response_fields)
                 else:
                     row = row_batch[row_idx]
                     instruction = first_present(row, instruction_fields)
@@ -454,8 +474,8 @@ def main() -> None:
                 if not instruction or not response:
                     skipped_rows += 1
                     continue
-                if isinstance(row_batch, dict):
-                    condition = first_present_column(row_batch, row_idx, condition_fields) or args.default_condition
+                if is_column_batch:
+                    condition = (cond_col[row_idx] if cond_col is not None else first_present_column(row_batch, row_idx, condition_fields)) or args.default_condition
                 else:
                     condition = first_present(row, condition_fields) or args.default_condition
                 instructions.append(str(instruction))
