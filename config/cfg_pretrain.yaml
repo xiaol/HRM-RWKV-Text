@@ -30,8 +30,11 @@ checkpoint_path: null
 
 resume_from: null
 resume_epoch: null
+init_from_safetensors: null
 weights_only_resume_from_ema: false
 
 seed: 0
 max_steps: null
+save_checkpoints: true
 log_interval: 5
+loss_history_path: null

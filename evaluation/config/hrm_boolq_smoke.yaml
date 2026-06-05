@@ -1,0 +1,17 @@
+engine: SimpleEngine
+ckpt_path: null
+
+generation_config:
+  batch_size: 1
+  max_context: 1024
+  temperature: 0.0
+  condition: direct
+
+benchmarks:
+  - name: BoolQ
+    split: validation[:16]
+    num_shots: 1
+    generation_config:
+      batch_size: 1
+      max_context: 1024
+      condition: direct

@@ -96,6 +96,7 @@ class HierarchicalHybridRWKV7Model(nn.Module):
         bp_steps: int = 2,
         **seq_info,
     ) -> Tuple[None, Tensor]:
+        x = x.to(dtype=self.zL_init.dtype)
         z_H, z_L = x, self.zL_init
 
         H_bp_steps = min(self.H_cycles, bp_steps - 1)

@@ -10,6 +10,12 @@ https://github.com/sapientinc/HRM-Text
 
 Refer to upstream HRM-Text for the original paper, architecture, training framework, evaluation stack, and license context. This fork is focused on local architecture validation and speed/loss comparison for RWKV-7 inside HRM-Text.
 
+Fork repository:
+
+```text
+https://github.com/xiaol/HRM-RWKV-Text
+```
+
 ## What Changed
 
 Added HRM core variants:
@@ -129,6 +135,51 @@ Current result after batching packed RWKV sequences:
 
 This is a short training-process validation run, not a final model-quality result.
 
+## Original HRM-Text Evaluation
+
+The upstream evaluation entrypoint is kept. For this fork, package a checkpoint directory with:
+
+```text
+all_config.yaml
+train_metadata.yaml
+model.safetensors
+```
+
+Prepared local aligned H-RWKV checkpoint:
+
+```text
+/run/media/xiaol/B214449214445C0B/hrm_text_eval_checkpoints/hrm_h_rwkv7_aligned_5000
+```
+
+4090 smoke run:
+
+```bash
+.venv/bin/python -m evaluation.main \
+  config=evaluation/config/hrm_boolq_smoke.yaml \
+  ckpt_path="/run/media/xiaol/B214449214445C0B/hrm_text_eval_checkpoints/hrm_h_rwkv7_aligned_5000"
+```
+
+Original benchmark command style:
+
+```bash
+.venv/bin/python -m evaluation.main \
+  ckpt_path="/run/media/xiaol/B214449214445C0B/hrm_text_eval_checkpoints/hrm_h_rwkv7_aligned_5000"
+```
+
+The default upstream evaluation config targets a much larger GPU than a 4090 for the CoT/freeform groups. On 4090, use `generation_config.batch_size=1` or the smoke config first, then run the full suite only if memory and runtime are acceptable.
+
+Completed local original-evaluator BoolQ run:
+
+```bash
+.venv/bin/python -m evaluation.main \
+  ckpt_path="/run/media/xiaol/B214449214445C0B/hrm_text_eval_checkpoints/hrm_h_rwkv7_aligned_5000" \
+  run_only=[BoolQ]
+```
+
+| benchmark | n | acc | invalid | generation time |
+| --- | ---: | ---: | ---: | ---: |
+| BoolQ | 3270 | 0.6873 | 0.1734 | 5m50s |
+
 ## Local 0.6B-Size Baseline
 
 For the upstream HRM-Text L/0.6B shape on a local RTX 4090, use:
@@ -154,13 +205,13 @@ The local 4090 comparison uses the 1B-token official subset and a common `1024` 
 
 This is still a short validation run, not full 1B-token pretraining.
 
-For actual local training with the upstream L effective batch, keep `global_batch_size=172032` and use gradient accumulation with the 4090-safe pretrain microbatch:
+For actual local training with the upstream L effective batch, keep `global_batch_size=172032` and use gradient accumulation with the 4090-safe pretrain microbatch. For RWKV-size matching, keep RWKV channel expansion at `1.0`; using the L-size default expansion `4.0` makes RWKV much larger and disables the LT2 channel kernel eligibility.
 
 ```bash
 WANDB_MODE=offline \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-PYTHONPATH=/home/xiaol/X/LT2_upstream \
-.venv/bin/python -m torch.distributed.run --nproc_per_node=1 pretrain.py \
+PYTHONPATH=/run/media/xiaol/B214449214445C0B/X_bak/LT2_upstream \
+.venv/bin/python pretrain.py \
   arch/net@arch=hrm_rwkv7 \
   arch/size@arch=L \
   data.path=/home/xiaol/X/hrm_text_subset_1B \
@@ -170,11 +221,53 @@ PYTHONPATH=/home/xiaol/X/LT2_upstream \
   max_steps=1 \
   checkpoint_interval=999 \
   compile_train=false \
+  ema=null \
+  arch.expansion=1.0 \
   arch.rwkv7_backend=cuda \
   run_name=hrm_rwkv7_l_1b_subset_b172k_micro512
 ```
 
-That gives `172032 / 512 = 336` gradient-accumulation microsteps per optimizer step on one 4090. A one-step 1B-subset smoke test passed with this setting in about 99 seconds; `micro_batch_size=1024` OOMed during the pretrain CE/loss path.
+That gives `172032 / 512 = 336` gradient-accumulation microsteps per optimizer step on one 4090. `ema=null` is used for the local 4090 comparison to keep optimizer state within 24 GB.
+
+## Local 10B Comparison
+
+A lightweight 10B subset is prepared at:
+
+```text
+/run/media/xiaol/B214449214445C0B/hrm_text_10b_v1
+```
+
+It reuses the full `tokens.bin` by symlink and stores only sliced V1 index arrays:
+
+```text
+rows: 29,095,087
+tokens: 10,000,000,064
+disk: 1.1 GB plus symlinked tokens.bin
+```
+
+Launch the sequential 10B comparison queue with:
+
+```bash
+scripts/run_10b_pretrain_compare.sh
+```
+
+The queue runs:
+
+| arch | params | important overrides |
+| --- | ---: | --- |
+| `transformer` | 694.68M | L default expansion `4.0` |
+| `rwkv7` | 667.62M | `arch.expansion=1.0`, `arch.rwkv7_backend=cuda` |
+| `hybrid_h_rwkv7` | 681.15M | `+arch.transformer_expansion=4.0`, `+arch.rwkv7_expansion=1.0` |
+| `hybrid_l_rwkv7` | 681.15M | `+arch.transformer_expansion=4.0`, `+arch.rwkv7_expansion=1.0` |
+
+Measured one-step `bp_steps=5` local 4090 calibration:
+
+| arch | step time | rough 10B time |
+| --- | ---: | ---: |
+| `transformer` | 41.8s | 27 days with BP warmup |
+| `rwkv7` | 56.8s | 37 days with BP warmup |
+| `hybrid_h_rwkv7` | 45.8s | 30 days with BP warmup |
+| `hybrid_l_rwkv7` | 52.3s | 34 days with BP warmup |
 
 ## Speed Notes
 

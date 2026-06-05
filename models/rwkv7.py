@@ -309,9 +309,9 @@ class RWKV7Block(nn.Module):
         self.channel_norm = lambda x: F.rms_norm(x, (x.shape[-1],), eps=config.norm_eps)
 
     def forward(self, x: Tensor, v_first: Optional[Tensor], reset_v_first: bool) -> Tuple[Tensor, Tensor]:
-        y, v_first = self.time_mix(self.time_norm(x), v_first=v_first, reset_v_first=reset_v_first)
+        y, v_first = self.time_mix(self.time_norm(x).to(dtype=x.dtype), v_first=v_first, reset_v_first=reset_v_first)
         x = x + y
-        return x + self.channel_mix(self.channel_norm(x)), v_first
+        return x + self.channel_mix(self.channel_norm(x).to(dtype=x.dtype)), v_first
 
 
 class RWKV7Stack(nn.Module):

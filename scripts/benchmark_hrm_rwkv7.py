@@ -206,6 +206,20 @@ def build_model(args: argparse.Namespace, arch: str, device: torch.device) -> to
         model = model.to(dtype=torch.float32)
     else:
         raise ValueError(args.dtype)
+    if args.init_from_safetensors:
+        from safetensors.torch import load_file
+
+        tensors = load_file(args.init_from_safetensors, device="cpu")
+        incompatible = model.load_state_dict(tensors, strict=False)
+        print(
+            f"init_from_safetensors={args.init_from_safetensors} "
+            f"loaded={len(tensors)} missing={len(incompatible.missing_keys)} "
+            f"unexpected={len(incompatible.unexpected_keys)}",
+            flush=True,
+        )
+        args._init_loaded_tensors = len(tensors)
+        args._init_missing_keys = len(incompatible.missing_keys)
+        args._init_unexpected_keys = len(incompatible.unexpected_keys)
     return model
 
 
@@ -214,6 +228,13 @@ def clear_cuda_cache(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
+
+
+def append_loss_record(args: argparse.Namespace, record: dict) -> None:
+    if not args.loss_history_out:
+        return
+    with Path(args.loss_history_out).open("a") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def count_params(model: torch.nn.Module) -> int:
@@ -239,6 +260,15 @@ def make_v1_loader(dataset_path: str, batch_tokens: int, target_only: bool, drop
         )
     )
     return DataLoader(dataset, batch_size=None, num_workers=0)
+
+
+def skip_v1_batches(iterator, num_batches: int):
+    for _ in range(num_batches):
+        try:
+            next(iterator)
+        except StopIteration:
+            break
+    return iterator
 
 
 @torch.no_grad()
@@ -289,10 +319,11 @@ def evaluate_v1_loss(args: argparse.Namespace, model: torch.nn.Module, device: t
     was_training = model.training
     model.eval()
     loader = make_v1_loader(args.v1_dataset_path, args.v1_eval_batch_tokens, args.v1_target_only, drop_last_batch=False)
+    iterator = skip_v1_batches(iter(loader), args.v1_skip_batches)
     losses = []
     supervised_tokens = 0
     total_tokens = 0
-    for idx, (batch, info) in enumerate(loader):
+    for idx, (batch, info) in enumerate(iterator):
         if idx >= batches:
             break
         batch = move_v1_batch_to_device(batch, info, device)
@@ -346,6 +377,17 @@ def run_arch(args: argparse.Namespace, arch: str, files: List[Path], device: tor
 
         if step >= args.warmup_steps:
             losses.append(float(loss.detach().cpu()))
+            append_loss_record(
+                args,
+                {
+                    "arch": arch,
+                    "phase": "timed",
+                    "raw_step": step,
+                    "step": step - args.warmup_steps + 1,
+                    "loss": losses[-1],
+                    "tokens": args.batch_size * args.seq_len,
+                },
+            )
         if args.verbose:
             phase = "warmup" if step < args.warmup_steps else "timed"
             print(f"{arch} {phase}_step={step} loss={float(loss.detach().cpu()):.6f}", flush=True)
@@ -380,6 +422,10 @@ def run_arch(args: argparse.Namespace, arch: str, files: List[Path], device: tor
         "H_arch": HYBRID_ARCHS.get(arch, (arch, arch))[0],
         "L_arch": HYBRID_ARCHS.get(arch, (arch, arch))[1],
         "params": count_params(model),
+        "init_from_safetensors": args.init_from_safetensors,
+        "init_loaded_tensors": getattr(args, "_init_loaded_tensors", 0),
+        "init_missing_keys": getattr(args, "_init_missing_keys", 0),
+        "init_unexpected_keys": getattr(args, "_init_unexpected_keys", 0),
         "expansion": _arch_expansion(args, arch),
         "transformer_expansion": args.transformer_expansion if args.transformer_expansion is not None else args.expansion,
         "rwkv7_expansion": args.rwkv7_expansion if args.rwkv7_expansion is not None else args.expansion,
@@ -405,6 +451,7 @@ def run_v1_arch(args: argparse.Namespace, arch: str, device: torch.device) -> di
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loader = make_v1_loader(args.v1_dataset_path, args.v1_batch_tokens, args.v1_target_only, drop_last_batch=True)
     iterator = iter(loader)
+    iterator = skip_v1_batches(iterator, args.v1_skip_batches)
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -440,6 +487,18 @@ def run_v1_arch(args: argparse.Namespace, arch: str, device: torch.device) -> di
             losses.append(float(loss.detach().cpu()))
             supervised_counts.append(int(metrics["loss"][1].detach().cpu()))
             token_counts.append(int(info["total_seqlen"]))
+            append_loss_record(
+                args,
+                {
+                    "arch": arch,
+                    "phase": "timed",
+                    "raw_step": step,
+                    "step": step - args.warmup_steps + 1,
+                    "loss": losses[-1],
+                    "supervised_tokens": supervised_counts[-1],
+                    "tokens": token_counts[-1],
+                },
+            )
         if args.verbose:
             phase = "warmup" if step < args.warmup_steps else "timed"
             print(
@@ -462,6 +521,10 @@ def run_v1_arch(args: argparse.Namespace, arch: str, device: torch.device) -> di
         "H_arch": HYBRID_ARCHS.get(arch, (arch, arch))[0],
         "L_arch": HYBRID_ARCHS.get(arch, (arch, arch))[1],
         "params": count_params(model),
+        "init_from_safetensors": args.init_from_safetensors,
+        "init_loaded_tensors": getattr(args, "_init_loaded_tensors", 0),
+        "init_missing_keys": getattr(args, "_init_missing_keys", 0),
+        "init_unexpected_keys": getattr(args, "_init_unexpected_keys", 0),
         "expansion": _arch_expansion(args, arch),
         "transformer_expansion": args.transformer_expansion if args.transformer_expansion is not None else args.expansion,
         "rwkv7_expansion": args.rwkv7_expansion if args.rwkv7_expansion is not None else args.expansion,
@@ -478,6 +541,7 @@ def run_v1_arch(args: argparse.Namespace, arch: str, device: torch.device) -> di
         "supervised_tokens_per_second": supervised_tokens / elapsed,
         "peak_memory_mb": peak_memory_mb,
         "v1_val_loss": v1_val_loss,
+        "loss_history_out": args.loss_history_out,
     }
 
 
@@ -491,6 +555,7 @@ def main() -> None:
     parser.add_argument("--v1-batch-tokens", type=int, default=4096)
     parser.add_argument("--v1-eval-batch-tokens", type=int, default=None)
     parser.add_argument("--v1-val-batches", type=int, default=10)
+    parser.add_argument("--v1-skip-batches", type=int, default=0, help="Skip this many V1 batches before train and eval loops.")
     parser.add_argument("--v1-target-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--val-patterns", default="", help="Comma-separated name=glob validation sets in Parameter Golf .bin format.")
     parser.add_argument("--max-val-shards", type=int, default=1)
@@ -523,6 +588,8 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--json-out", default="")
+    parser.add_argument("--init-from-safetensors", default="", help="Load a full or partial safetensors state dict before benchmarking.")
+    parser.add_argument("--loss-history-out", default="", help="Write one JSONL record for each timed training loss.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     args.final_val = not args.no_final_val
@@ -534,6 +601,10 @@ def main() -> None:
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
     device = torch.device(args.device)
+    if args.loss_history_out:
+        loss_history_path = Path(args.loss_history_out)
+        loss_history_path.parent.mkdir(parents=True, exist_ok=True)
+        loss_history_path.write_text("")
 
     results = []
     archs = [normalize_arch(x) for x in args.archs.split(",") if x.strip()]

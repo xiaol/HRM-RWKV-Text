@@ -73,6 +73,7 @@ class HierarchicalReasoningModel(nn.Module):
                                                   L=[self.L_level.create_cache(**kwargs) for _i in range(self.H_cycles * self.L_cycles)])
 
     def forward(self, carry: None, x: torch.Tensor, cache: Optional[dict[str, list[list[Cache]]]] = None, bp_steps: int = 2, **seq_info) -> Tuple[None, torch.Tensor]:
+        x = x.to(dtype=self.zL_init.dtype)
         z_H, z_L = x, self.zL_init
 
         # Calculate H and L bp_steps

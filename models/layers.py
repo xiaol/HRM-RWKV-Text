@@ -11,8 +11,34 @@ from models.flash_attention_prefixlm_v2 import flash_attn_varlen_prefixlm
 try:
     from flash_attn_interface import flash_attn_with_kvcache
 except ModuleNotFoundError:
-    def flash_attn_with_kvcache(*args, **kwargs):
-        raise RuntimeError("flash_attn_3 is required for KV-cache inference.")
+    def flash_attn_with_kvcache(q: Tensor, k: Tensor, v: Tensor, k_cache: Tensor, v_cache: Tensor, cache_seqlens, causal: bool = False, **_kwargs):
+        """PyTorch fallback for 4090/local eval where FA3 KV-cache kernels are unavailable."""
+        batch, seq_len = q.shape[:2]
+        if isinstance(cache_seqlens, Tensor):
+            if cache_seqlens.dim() == 0:
+                lengths = torch.full((batch,), int(cache_seqlens.item()), device=k_cache.device, dtype=torch.long)
+            else:
+                lengths = cache_seqlens.to(device=k_cache.device, dtype=torch.long)
+        else:
+            lengths = torch.full((batch,), int(cache_seqlens), device=k_cache.device, dtype=torch.long)
+
+        out = torch.empty_like(q)
+        for b in range(batch):
+            start = int(lengths[b].item())
+            end = start + seq_len
+            k_cache[b, start:end].copy_(k[b])
+            v_cache[b, start:end].copy_(v[b])
+
+            qb = q[b:b + 1].transpose(1, 2)
+            kb = k_cache[b:b + 1, :end].transpose(1, 2)
+            vb = v_cache[b:b + 1, :end].transpose(1, 2)
+            attn_mask = None
+            if causal and seq_len > 1:
+                q_pos = torch.arange(start, end, device=q.device).unsqueeze(1)
+                k_pos = torch.arange(end, device=q.device).unsqueeze(0)
+                attn_mask = k_pos <= q_pos
+            out[b:b + 1] = F.scaled_dot_product_attention(qb, kb, vb, attn_mask=attn_mask).transpose(1, 2)
+        return out
 
 
 Carry = dict[str, Any]

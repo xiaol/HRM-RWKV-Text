@@ -7,6 +7,8 @@ H_cycles: 2
 L_cycles: 3
 H_arch: rwkv7
 L_arch: transformer
+transformer_expansion: 4.0
+rwkv7_expansion: 1.0
 H_override: {}
 L_override: {}
 

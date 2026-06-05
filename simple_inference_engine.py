@@ -15,11 +15,17 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from pretrain import Carry, PretrainConfig, V1DatasetMeta, load_model_class, AdamATan2
 
+try:
+    import flash_attn_interface as _flash_attn_interface  # noqa: F401
+    _COMPILE_KV_CACHE_GENERATION = True
+except ModuleNotFoundError:
+    _COMPILE_KV_CACHE_GENERATION = False
+
 
 @dataclass
 class InferenceCheckpoint:
     model: nn.Module
-    carry: Carry
+    carry: Optional[Carry]
     tokenizer: PreTrainedTokenizer
     tokenizer_info: dict[str, Any]
 
@@ -51,12 +57,30 @@ def inference_load_checkpoint(ckpt_path: str, ckpt_epoch: Optional[int], ckpt_us
         model: nn.Module = model_cls(combined_cfg)
         # Attach loss head
         model = head_cls(model, combined_cfg)
-        # Optimizer (ONLY for loading states)
-        optim = AdamATan2(model.parameters(),
-                        lr=torch.tensor(0.0, dtype=torch.get_default_dtype(), device="cpu"),
-                        betas=(model_cfg.beta1, model_cfg.beta2),
-                        weight_decay=model_cfg.weight_decay,
-                        ema=model_cfg.ema)
+
+    safetensors_path = os.path.join(ckpt_path, "model.safetensors")
+    if os.path.exists(safetensors_path):
+        from safetensors.torch import load_file
+
+        model = model.to(getattr(torch, model_cfg.fwd_bwd_dtype))
+        tensors = load_file(safetensors_path, device="cpu")
+        model.load_state_dict(tensors, strict=True)
+        print(f"Loaded safetensors checkpoint: {safetensors_path}")
+
+        tokenizer = AutoTokenizer.from_pretrained(train_metadata.tokenizer_info["tokenizer_path"], use_fast=True)
+        return InferenceCheckpoint(
+            model=model.eval(),
+            carry=None,
+            tokenizer=tokenizer,
+            tokenizer_info=train_metadata.tokenizer_info
+        )
+
+    # Optimizer (ONLY for loading DCP training states)
+    optim = AdamATan2(model.parameters(),
+                    lr=torch.tensor(0.0, dtype=torch.get_default_dtype(), device="cpu"),
+                    betas=(model_cfg.beta1, model_cfg.beta2),
+                    weight_decay=model_cfg.weight_decay,
+                    ema=model_cfg.ema)
     
     # Detect checkpoint epoch if not specified
     if ckpt_epoch is None:
@@ -102,18 +126,35 @@ def _sample(logits: Tensor, temp: float) -> Tensor:
     return _sample_gumbel(logits, torch.tensor(temp, dtype=torch.float32))
 
 
-@torch.compile(fullgraph=True)
+def _compile_generation_fn(**kwargs):
+    def decorator(fn):
+        if _COMPILE_KV_CACHE_GENERATION:
+            return torch.compile(**kwargs)(fn)
+        return fn
+    return decorator
+
+
+def _slice_cache_for_batch(cache: Any, index: int) -> Any:
+    return pytree.tree_map(lambda x: None if x is None else x[index: index + 1], cache)
+
+
+@_compile_generation_fn(fullgraph=True)
 def _prefill(model: nn.Module, carry: Carry, inputs: Tensor, cache: Any) -> Tensor:
-    return model(carry=carry, batch={"inputs": inputs.unsqueeze(0), "position_ids": torch.arange(inputs.shape[0]), "cache": cache, "cache_lengths": 0})[-1][..., -1, :]
+    return model(carry=carry, batch={
+        "inputs": inputs.unsqueeze(0),
+        "position_ids": torch.arange(inputs.shape[0], device=inputs.device),
+        "cache": cache,
+        "cache_lengths": 0
+    })[-1][..., -1, :]
 
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_compile_generation_fn(dynamic=False, fullgraph=True)
 def _batched_decode(model: nn.Module, carry: Carry, inputs: Tensor, cache: Any, cache_lengths: Tensor) -> Tensor:
     return model(carry=carry, batch={"inputs": inputs.unsqueeze(-1), "position_ids": cache_lengths.unsqueeze(-1), "cache": cache, "cache_lengths": cache_lengths})[-1][..., -1, :]
 
 
 @torch.inference_mode()
-def inference_generate(ckpt: InferenceCheckpoint, iterator: Iterator[tuple[int, tuple[str, str]]], max_tokens: int, max_generation: int, batch_size: int, temp: float = 0.0) -> Generator[tuple[int, str], None]:
+def inference_generate(ckpt: InferenceCheckpoint, iterator: Iterator[tuple[int, tuple[str, str]]], max_tokens: int, max_generation: int, batch_size: int, temp: float = 0.0) -> Generator[tuple[int, str], None, None]:
     def fetch_next():
         for pid, p_tuple in iterator:
             tok = ckpt.tokenize_prompt(*p_tuple)
@@ -152,7 +193,7 @@ def inference_generate(ckpt: InferenceCheckpoint, iterator: Iterator[tuple[int, 
                 inputs = torch.from_numpy(tokenized_prompt).cuda()  # <--- NOTE CPU to GPU (async)
 
                 torch._dynamo.mark_dynamic(inputs, 0, min=1, max=max_tokens)
-                gpu_last_tokens[i] = _sample(_prefill(ckpt.model, ckpt.carry, inputs, pytree.tree_map(lambda x: x[i: i+1], gpu_cache)), temp)[0]
+                gpu_last_tokens[i] = _sample(_prefill(ckpt.model, ckpt.carry, inputs, _slice_cache_for_batch(gpu_cache, i)), temp)[0]
                 gpu_cache_lengths[i] = length
                 launched_prefill = True
 

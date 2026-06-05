@@ -4,6 +4,7 @@ from pathlib import Path
 from glob import glob
 import math
 import os
+import json
 import yaml
 import shutil
 
@@ -73,13 +74,16 @@ class PretrainConfig(pydantic.BaseModel):
     # Resume / fine-tune from checkpoint
     resume_from: Optional[str] = None
     resume_epoch: Optional[int] = None
+    init_from_safetensors: Optional[str] = None
     weights_only_resume_from_ema: bool = False  # Swap EMA into model + reset optim
 
     # Extras
     seed: int = 0
     max_steps: Optional[int] = None
     checkpoint_interval: int = 1
+    save_checkpoints: bool = True
     log_interval: int = 5
+    loss_history_path: Optional[str] = None
 
 
 @dataclass
@@ -131,7 +135,24 @@ def apply_fsdp(module: nn.Module, param_dtype: torch.dtype):
     module.set_force_sum_reduction_for_comms(True)
 
 
-def create_model_and_carry(config: PretrainConfig, train_metadata: V1DatasetMeta, local_batch_size: int):
+def load_initial_safetensors(config: PretrainConfig, model: nn.Module, rank: int) -> None:
+    if config.init_from_safetensors is None:
+        return
+
+    from safetensors.torch import load_file
+
+    tensors = load_file(config.init_from_safetensors, device="cpu")
+    incompatible = model.load_state_dict(tensors, strict=False)
+    if rank == 0:
+        print(
+            f"[Init] Loaded {len(tensors)} tensors from {config.init_from_safetensors}; "
+            f"missing={len(incompatible.missing_keys)} unexpected={len(incompatible.unexpected_keys)}"
+        )
+        if incompatible.unexpected_keys:
+            print(f"[Init] Unexpected keys: {incompatible.unexpected_keys[:20]}")
+
+
+def create_model_and_carry(config: PretrainConfig, train_metadata: V1DatasetMeta, local_batch_size: int, world_size: int, rank: int):
     model_cfg = config.arch.model_dump() | train_metadata.model_dump() | config.data.model_dump()
     fwd_bwd_dtype = getattr(torch, config.fwd_bwd_dtype)
 
@@ -144,18 +165,24 @@ def create_model_and_carry(config: PretrainConfig, train_metadata: V1DatasetMeta
         carry = model.initial_carry(local_batch_size, dtype=fwd_bwd_dtype)  # pyright: ignore[reportCallIssue]
         # Attach loss head
         model = head_cls(model, model_cfg)
+        if world_size == 1 and fwd_bwd_dtype != torch.float32:
+            model = model.to(dtype=fwd_bwd_dtype)
+        load_initial_safetensors(config, model, rank)
 
     # ----FSDP----
-    # Broadcast buffers
-    for buffer in model.buffers():
-        dist.broadcast(buffer, src=0)
+    # FSDP only helps when parameters are actually sharded across ranks. On a
+    # single 4090 it adds all-gather/reduce buffers without reducing model size.
+    if world_size > 1:
+        # Broadcast buffers
+        for buffer in model.buffers():
+            dist.broadcast(buffer, src=0)
 
-    # Detect TransformerBlock recursively and apply FSDP
-    for module in model.modules():
-        if isinstance(module, TransformerBlock):
-            apply_fsdp(module, fwd_bwd_dtype)
+        # Detect TransformerBlock recursively and apply FSDP
+        for module in model.modules():
+            if isinstance(module, TransformerBlock):
+                apply_fsdp(module, fwd_bwd_dtype)
 
-    apply_fsdp(model, fwd_bwd_dtype)
+        apply_fsdp(model, fwd_bwd_dtype)
 
     # ----Create optimizer----
     optim = AdamATan2(model.parameters(),
@@ -187,7 +214,7 @@ def init_train(config: PretrainConfig, rank: int, world_size: int):
     train_loader, train_metadata = create_dataloader(config, local_micro_batch_size, drop_last_batch=True,  rank=rank, world_size=world_size)
 
     # Model
-    model, carry, optim = create_model_and_carry(config, train_metadata, local_micro_batch_size)
+    model, carry, optim = create_model_and_carry(config, train_metadata, local_micro_batch_size, world_size, rank)
 
     # Train state
     # Estimated total training steps
@@ -227,13 +254,15 @@ def train_batch(train_state: TrainState, batch: dict[str, Tensor], **kwargs):
     return metrics
 
 
-def train_microbatch(train_state: TrainState, batch: dict[str, Tensor], loss_divisor: Tensor, **kwargs):
-    train_state.carry, loss, metrics = train_state.model(
-        batch=batch,
-        carry=train_state.carry,
-        loss_divisor_override=loss_divisor,
-        **kwargs,
-    )
+def train_microbatch(train_state: TrainState, batch: dict[str, Tensor], loss_divisor: Tensor, autocast_dtype: Optional[torch.dtype] = None, **kwargs):
+    autocast_enabled = autocast_dtype is not None and batch["inputs"].is_cuda
+    with torch.autocast(device_type="cuda", dtype=autocast_dtype or torch.bfloat16, enabled=autocast_enabled):
+        train_state.carry, loss, metrics = train_state.model(
+            batch=batch,
+            carry=train_state.carry,
+            loss_divisor_override=loss_divisor,
+            **kwargs,
+        )
     loss.backward()
     return metrics
 
@@ -265,6 +294,18 @@ def reduce_metrics(local_metrics: dict[str, Tensor], prefix: str):
     metrics, metrics_div = metric_values.chunk(2, dim=-1)
     metrics = (metrics / metrics_div).cpu().numpy().tolist()
     return {prefix + name: metrics[idx] for idx, name in enumerate(metric_keys)}
+
+
+def append_loss_history(config: PretrainConfig, epoch: int, step: int, metrics: dict[str, Any]) -> None:
+    if config.loss_history_path is None:
+        return
+    history_dir = os.path.dirname(config.loss_history_path)
+    if history_dir:
+        os.makedirs(history_dir, exist_ok=True)
+    record = {"epoch": epoch, "step": step}
+    record.update(metrics)
+    with open(config.loss_history_path, "a") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def load_checkpoint(config: PretrainConfig, train_state: TrainState):
@@ -311,7 +352,7 @@ def load_checkpoint(config: PretrainConfig, train_state: TrainState):
 
 
 def save_code_and_config(config: PretrainConfig, train_metadata: V1DatasetMeta):
-    if config.checkpoint_path is None or wandb.run is None:
+    if (not config.save_checkpoints) or config.checkpoint_path is None or wandb.run is None:
         return
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
@@ -334,6 +375,19 @@ def save_code_and_config(config: PretrainConfig, train_metadata: V1DatasetMeta):
 
     # Log code
     wandb.run.log_code(config.checkpoint_path)
+
+
+def save_training_checkpoint(config: PretrainConfig, train_state: TrainState, epoch: int, rank: int, tag: str):
+    if (not config.save_checkpoints) or config.checkpoint_path is None:
+        return
+
+    checkpoint_id = os.path.join(config.checkpoint_path, f"fsdp2_{tag}")
+    dcp.save(
+        {"model": train_state.model.state_dict(), "optim": get_optimizer_state_dict(train_state.model, train_state.optim)},  # pyright: ignore[reportPrivateImportUsage]
+        checkpoint_id=checkpoint_id,
+    )
+    torch.save(train_state.carry, os.path.join(config.checkpoint_path, f"carry_{tag}.{rank}.pt"))
+    torch.save({"epoch": epoch, "step": train_state.step}, os.path.join(config.checkpoint_path, f"train_state_{tag}.{rank}.pt"))
 
 
 def load_synced_config(hydra_config: DictConfig, rank: int) -> PretrainConfig:
@@ -371,11 +425,18 @@ def launch(hydra_config: DictConfig):
         DEVICE_ID = int(os.environ["LOCAL_RANK"])
 
         torch.cuda.set_device(DEVICE_ID)
+    else:
+        torch.cuda.set_device(DEVICE_ID)
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        dist.init_process_group(backend="nccl", rank=0, world_size=1)
 
     device = torch.device("cuda", DEVICE_ID)
 
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK)
+    if config.resume_from is not None and config.init_from_safetensors is not None:
+        raise ValueError("Use either resume_from or init_from_safetensors, not both.")
 
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
@@ -387,6 +448,7 @@ def launch(hydra_config: DictConfig):
     local_micro_batch_size = get_local_micro_batch_size(config, WORLD_SIZE)
     grad_accum_steps = local_effective_batch_size // local_micro_batch_size
     train_microbatch_fn = train_microbatch_compiled if config.compile_train else train_microbatch
+    autocast_dtype = getattr(torch, config.fwd_bwd_dtype) if WORLD_SIZE == 1 else None
 
     # Progress bar and logger
     progress_bar = None
@@ -434,7 +496,7 @@ def launch(hydra_config: DictConfig):
             metrics_accum: Optional[dict[str, tuple[Tensor, Tensor]]] = None
             for batch, batch_info in zip(microbatches, microbatch_infos):
                 batch = move_batch_to_device(batch, device)
-                metrics = train_microbatch_fn(train_state, batch | batch_info, loss_divisor=loss_divisor, **train_extra_args)
+                metrics = train_microbatch_fn(train_state, batch | batch_info, loss_divisor=loss_divisor, autocast_dtype=autocast_dtype, **train_extra_args)
                 if metrics_accum is None:
                     metrics_accum = {k: (v[0].detach(), v[1].detach()) for k, v in metrics.items()}
                 else:
@@ -451,8 +513,10 @@ def launch(hydra_config: DictConfig):
                 metrics = reduce_metrics(metrics, prefix="train/")
                 if RANK == 0:
                     progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                    log_metrics = metrics | train_extra_args | {"train/lr": lr, "train/grad_accum_steps": grad_accum_steps}
+                    append_loss_history(config, epoch, train_state.step, log_metrics)
                     wandb.log(
-                        metrics | train_extra_args | {"train/lr": lr, "train/grad_accum_steps": grad_accum_steps},
+                        log_metrics,
                         step=train_state.step,
                     )
 
@@ -462,18 +526,14 @@ def launch(hydra_config: DictConfig):
                 break
 
         if config.max_steps is not None and train_state.step >= config.max_steps:
+            save_training_checkpoint(config, train_state, epoch, RANK, f"step_{train_state.step}")
             break
 
         ############ EVAL STACK: TBD TODO
 
         ############ Checkpointing
         if (epoch % config.checkpoint_interval == 0) or (epoch == config.epochs):
-            if config.checkpoint_path is not None:
-                # Save checkpoint
-                dcp.save({"model": train_state.model.state_dict(), "optim": get_optimizer_state_dict(train_state.model, train_state.optim)},  # pyright: ignore[reportPrivateImportUsage]
-                         checkpoint_id=os.path.join(config.checkpoint_path, f"fsdp2_epoch_{epoch}"))
-                # Save carry on all ranks
-                torch.save(train_state.carry, os.path.join(config.checkpoint_path, f"carry_epoch_{epoch}.{RANK}.pt"))
+            save_training_checkpoint(config, train_state, epoch, RANK, f"epoch_{epoch}")
 
     # finalize
     if dist.is_initialized():
