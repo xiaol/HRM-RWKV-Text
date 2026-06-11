@@ -29,7 +29,9 @@ run_name: null
 checkpoint_path: null
 
 resume_from: null
+resume_tag: null
 resume_epoch: null
+resume_skip_data: true
 init_from_safetensors: null
 weights_only_resume_from_ema: false
 

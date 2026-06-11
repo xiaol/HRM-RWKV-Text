@@ -54,6 +54,12 @@ class V1Dataset(IterableDataset):
         self._data_indices: Optional[V1DatasetIndices] = None
         self._sampler: Optional[MultipackDistributedBatchSampler] = None
         self._epoch = 0
+        self._skip_batches = 0
+
+    def set_skip_batches(self, skip_batches: int) -> None:
+        if skip_batches < 0:
+            raise ValueError("skip_batches must be non-negative")
+        self._skip_batches = skip_batches
 
     def _load_metadata(self) -> V1DatasetMeta:
         with open(os.path.join(self.config.dataset_path, "metadata.json"), "r") as f:
@@ -154,5 +160,7 @@ class V1Dataset(IterableDataset):
         self._load_dataset_before_epoch_begin()
 
         assert self._sampler is not None
-        for indices in self._sampler.iter():
+        for batch_index, indices in enumerate(self._sampler.iter()):
+            if batch_index < self._skip_batches:
+                continue
             yield self._load_batch(indices)

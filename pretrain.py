@@ -5,6 +5,7 @@ from glob import glob
 import math
 import os
 import json
+import signal
 import yaml
 import shutil
 
@@ -73,7 +74,9 @@ class PretrainConfig(pydantic.BaseModel):
 
     # Resume / fine-tune from checkpoint
     resume_from: Optional[str] = None
+    resume_tag: Optional[str] = None
     resume_epoch: Optional[int] = None
+    resume_skip_data: bool = True
     init_from_safetensors: Optional[str] = None
     weights_only_resume_from_ema: bool = False  # Swap EMA into model + reset optim
 
@@ -339,7 +342,52 @@ def append_loss_history(config: PretrainConfig, epoch: int, step: int, metrics: 
         f.write(json.dumps(record, sort_keys=True) + "\n")
 
 
-def load_checkpoint(config: PretrainConfig, train_state: TrainState):
+def _checkpoint_step(config: PretrainConfig, tag: str, rank: int) -> tuple[int, int]:
+    state_path = os.path.join(config.resume_from or "", f"train_state_{tag}.{rank}.pt")
+    if os.path.isfile(state_path):
+        state = torch.load(state_path, map_location="cpu", weights_only=True)
+        return int(state.get("epoch", 1)), int(state.get("step", 0))
+
+    if tag.startswith("step_"):
+        return 1, int(tag.removeprefix("step_"))
+    if tag.startswith("epoch_"):
+        return int(tag.removeprefix("epoch_")), 0
+    raise ValueError(f"Cannot infer training state from checkpoint tag: {tag}")
+
+
+def _resolve_resume_tag(config: PretrainConfig, rank: int) -> tuple[str, int, int]:
+    assert config.resume_from is not None
+    if config.resume_tag is not None:
+        tag = config.resume_tag.removeprefix("fsdp2_")
+        checkpoint_id = os.path.join(config.resume_from, f"fsdp2_{tag}")
+        if not os.path.isdir(checkpoint_id):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_id}")
+        epoch, step = _checkpoint_step(config, tag, rank)
+        return tag, epoch, step
+
+    candidates = []
+    for checkpoint_id in glob(os.path.join(config.resume_from, "fsdp2_*")):
+        if not os.path.isdir(checkpoint_id):
+            continue
+        tag = Path(checkpoint_id).name.removeprefix("fsdp2_")
+        try:
+            epoch, step = _checkpoint_step(config, tag, rank)
+        except (FileNotFoundError, ValueError):
+            continue
+        candidates.append((step, epoch, tag))
+
+    if config.resume_epoch is not None:
+        tag = f"epoch_{config.resume_epoch}"
+        epoch, step = _checkpoint_step(config, tag, rank)
+        return tag, epoch, step
+    if not candidates:
+        raise FileNotFoundError(f"No checkpoint found in {config.resume_from}")
+
+    step, epoch, tag = max(candidates)
+    return tag, epoch, step
+
+
+def load_checkpoint(config: PretrainConfig, train_state: TrainState, rank: int):
     """Resume from a saved checkpoint.
 
     Loads both model weights and optimizer state (which carries EMA in
@@ -350,15 +398,9 @@ def load_checkpoint(config: PretrainConfig, train_state: TrainState):
     if config.resume_from is None:
         return
 
-    epoch = config.resume_epoch
-    if epoch is None:
-        ckpt_files = glob(os.path.join(config.resume_from, "fsdp2_epoch_*"))
-        if not ckpt_files:
-            raise FileNotFoundError(f"No checkpoint found in {config.resume_from}")
-        epoch = max(int(Path(f).stem.split("_")[-1]) for f in ckpt_files)
-
-    checkpoint_id = os.path.join(config.resume_from, f"fsdp2_epoch_{epoch}")
-    print(f"[Resume] Loading model + optimizer from {checkpoint_id}")
+    tag, epoch, step = _resolve_resume_tag(config, rank)
+    checkpoint_id = os.path.join(config.resume_from, f"fsdp2_{tag}")
+    print(f"[Resume] Loading model + optimizer from {checkpoint_id} (epoch={epoch}, step={step})")
     optim_state = get_optimizer_state_dict(train_state.model, train_state.optim)
     dcp.load(
         {"model": train_state.model.state_dict(), "optim": optim_state},
@@ -374,12 +416,18 @@ def load_checkpoint(config: PretrainConfig, train_state: TrainState):
         param_group["weight_decay"] = config.weight_decay
         param_group["ema"] = config.ema
 
+    train_state.step = step
+    carry_path = os.path.join(config.resume_from, f"carry_{tag}.{rank}.pt")
+    if os.path.isfile(carry_path):
+        train_state.carry = torch.load(carry_path, map_location="cpu", weights_only=False)
+
     if config.weights_only_resume_from_ema:
         print("[Resume] Swapping EMA into model and resetting optimizer state")
         train_state.optim.swap_ema()
         train_state.optim._init_state()
+        train_state.step = 0
 
-    print(f"[Resume] Done.")
+    print(f"[Resume] Done at step {train_state.step}.")
 
 
 def save_code_and_config(config: PretrainConfig, train_metadata: V1DatasetMeta):
@@ -474,17 +522,40 @@ def launch(hydra_config: DictConfig):
 
     # --- Training
     train_state, train_loader, train_metadata = init_train(config, rank=RANK, world_size=WORLD_SIZE)
-    load_checkpoint(config, train_state)
+    load_checkpoint(config, train_state, rank=RANK)
     local_effective_batch_size = config.global_batch_size // WORLD_SIZE
     local_micro_batch_size = get_local_micro_batch_size(config, WORLD_SIZE)
     grad_accum_steps = local_effective_batch_size // local_micro_batch_size
+    if config.resume_from is not None and config.resume_skip_data and train_state.step > 0:
+        skip_batches = train_state.step * grad_accum_steps
+        dataset = train_loader.dataset
+        if not isinstance(dataset, V1Dataset):
+            raise TypeError("resume_skip_data requires V1Dataset")
+        dataset.set_skip_batches(skip_batches)
+        print(f"[Resume] Skipping {skip_batches:,} consumed microbatches.")
+
+    stop_requested = False
+
+    def request_stop(signum, _frame):
+        nonlocal stop_requested
+        stop_requested = True
+        if RANK == 0:
+            print(
+                f"\n[Signal] Received {signal.Signals(signum).name}; "
+                "will checkpoint after the current optimizer step.",
+                flush=True,
+            )
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+
     train_microbatch_fn = train_microbatch_compiled if config.compile_train else train_microbatch
     autocast_dtype = getattr(torch, config.fwd_bwd_dtype) if WORLD_SIZE == 1 else None
 
     # Progress bar and logger
     progress_bar = None
     if RANK == 0:
-        progress_bar = tqdm.tqdm(total=train_state.total_steps)
+        progress_bar = tqdm.tqdm(total=train_state.total_steps, initial=train_state.step)
 
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump() | {"train_metadata": train_metadata.model_dump()},
                    settings=wandb.Settings(_disable_stats=True))  # type: ignore
@@ -553,10 +624,12 @@ def launch(hydra_config: DictConfig):
 
             del metrics
 
+            if stop_requested:
+                break
             if config.max_steps is not None and train_state.step >= config.max_steps:
                 break
 
-        if config.max_steps is not None and train_state.step >= config.max_steps:
+        if stop_requested or (config.max_steps is not None and train_state.step >= config.max_steps):
             save_training_checkpoint(config, train_state, epoch, RANK, f"step_{train_state.step}")
             break
 
@@ -570,6 +643,8 @@ def launch(hydra_config: DictConfig):
     if dist.is_initialized():
         dist.destroy_process_group()
     wandb.finish()
+    if stop_requested and RANK == 0:
+        print(f"[Signal] Safe stop complete at step {train_state.step}.", flush=True)
 
 
 if __name__ == "__main__":

@@ -316,6 +316,50 @@ The result is technically positive but small. The accepted run improved MMLU fro
 
 The next serious iteration should focus on robustness rather than only chasing a single score: repeat the `step_200` recipe with another seed, try lower LR such as `1e-4`, and evaluate intermediate checkpoints if MMLU begins to regress after CE improves. Persistent decode state is also required before using this adapter for long-form generation metrics.
 
+### Spare-Time Resumable Scaling
+
+Use the spare-time controller to continue the accepted `step_200` checkpoint toward `0.6B` training tokens. It runs in the background and uses the 2 TB SSD for checkpoints and logs:
+
+```bash
+bash scripts/rwkv_mem_spare_train.sh start
+bash scripts/rwkv_mem_spare_train.sh status
+bash scripts/rwkv_mem_spare_train.sh log
+bash scripts/rwkv_mem_spare_train.sh stop
+bash scripts/rwkv_mem_spare_train.sh resume
+```
+
+`stop` sends a graceful termination request. The trainer finishes the active optimizer step, writes `fsdp2_step_N` with model and optimizer state, and exits. Do not reboot until `stop` reports `safe stop complete`. `resume` loads the newest step checkpoint and skips the already-consumed data batches, so it continues the same training stream instead of replaying the beginning.
+
+Defaults:
+
+```text
+bootstrap: accepted RWKV-memory step_200 checkpoint
+target: 600,000,000 tokens
+target optimizer step: 3,052
+session length: 100 optimizer steps, about 1.3 hours on the local RTX 4090
+checkpoint/log storage: /run/media/xiaol/B214449214445C0B
+```
+
+Each `start` or `resume` runs one session. A session can end naturally or be stopped early. Change its planned duration without changing the final target:
+
+```bash
+SESSION_STEPS=25 bash scripts/rwkv_mem_spare_train.sh resume
+```
+
+Change the final scaling target:
+
+```bash
+TARGET_TOKENS=1000000000 bash scripts/rwkv_mem_spare_train.sh resume
+```
+
+Run MMLU manually on the latest completed checkpoint:
+
+```bash
+bash scripts/rwkv_mem_spare_train.sh eval
+```
+
+Step checkpoints are large, about `3.6 GB` for the accepted run, so old non-milestone checkpoints should be removed periodically only after a newer checkpoint and its MMLU result have been verified.
+
 ## Original HRM-Text Evaluation
 
 The upstream evaluation entrypoint is kept. For this fork, package a checkpoint directory with:
