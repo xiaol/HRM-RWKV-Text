@@ -84,6 +84,7 @@ class PretrainConfig(pydantic.BaseModel):
     save_checkpoints: bool = True
     log_interval: int = 5
     loss_history_path: Optional[str] = None
+    trainable_param_substrings: Optional[list[str]] = None
 
 
 @dataclass
@@ -152,6 +153,32 @@ def load_initial_safetensors(config: PretrainConfig, model: nn.Module, rank: int
             print(f"[Init] Unexpected keys: {incompatible.unexpected_keys[:20]}")
 
 
+def apply_trainable_filter(config: PretrainConfig, model: nn.Module, rank: int) -> None:
+    patterns = config.trainable_param_substrings
+    if not patterns:
+        return
+
+    trainable_names: list[str] = []
+    trainable_count = 0
+    for name, param in model.named_parameters():
+        trainable = any(pattern in name for pattern in patterns)
+        param.requires_grad_(trainable)
+        if trainable:
+            trainable_count += param.numel()
+            trainable_names.append(name)
+
+    if trainable_count == 0:
+        raise ValueError(f"No trainable parameters matched trainable_param_substrings={patterns}")
+
+    if rank == 0:
+        total_params = sum(p.numel() for p in model.parameters())
+        print(
+            f"[Trainable] patterns={patterns} trainable={trainable_count:,} "
+            f"total={total_params:,} ratio={trainable_count / total_params:.6f}"
+        )
+        print(f"[Trainable] first matched names: {trainable_names[:20]}")
+
+
 def create_model_and_carry(config: PretrainConfig, train_metadata: V1DatasetMeta, local_batch_size: int, world_size: int, rank: int):
     model_cfg = config.arch.model_dump() | train_metadata.model_dump() | config.data.model_dump()
     fwd_bwd_dtype = getattr(torch, config.fwd_bwd_dtype)
@@ -168,6 +195,7 @@ def create_model_and_carry(config: PretrainConfig, train_metadata: V1DatasetMeta
         if world_size == 1 and fwd_bwd_dtype != torch.float32:
             model = model.to(dtype=fwd_bwd_dtype)
         load_initial_safetensors(config, model, rank)
+        apply_trainable_filter(config, model, rank)
 
     # ----FSDP----
     # FSDP only helps when parameters are actually sharded across ranks. On a
@@ -185,7 +213,10 @@ def create_model_and_carry(config: PretrainConfig, train_metadata: V1DatasetMeta
         apply_fsdp(model, fwd_bwd_dtype)
 
     # ----Create optimizer----
-    optim = AdamATan2(model.parameters(),
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable parameters available for optimizer")
+    optim = AdamATan2(trainable_params,
                       lr=torch.tensor(0.0, dtype=torch.get_default_dtype(), device="cpu"),
                       betas=(config.beta1, config.beta2),
                       weight_decay=config.weight_decay,

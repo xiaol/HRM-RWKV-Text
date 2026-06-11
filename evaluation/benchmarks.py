@@ -28,7 +28,7 @@ class GSM8k(BaseBenchmark):
     def __init__(self, split: str = "test"):
         super().__init__()
 
-        dataset = load_dataset("gsm8k", "main", split=split)
+        dataset = load_dataset("openai/gsm8k", "main", split=split)
         self.prompts = dataset["question"]
         self.ground_truths = [self._extract_truth(sol) for sol in dataset["answer"]]
 

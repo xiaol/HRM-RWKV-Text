@@ -144,17 +144,77 @@ class Cache(NamedTuple):
 
 
 class Attention(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, attn_type, init_std_in=None, init_std_out=None, **kwargs):
+    def __init__(
+        self,
+        hidden_size,
+        head_dim,
+        num_heads,
+        num_key_value_heads,
+        attn_type,
+        max_seq_len,
+        init_std_in=None,
+        init_std_out=None,
+        rwkv_mem_enabled: bool = False,
+        rwkv_mem_head_size: int = 64,
+        rwkv_mem_backend: str = "auto",
+        rwkv_mem_chunk_len: int = 16,
+        rwkv_mem_scale: float = 1.0,
+        rwkv_mem_output_init: str = "zero",
+        rwkv_mem_output_init_scale: float = 0.02,
+        rwkv_mem_delta_heads: Sequence[str] = ("o",),
+        rwkv_mem_separate_delta_projections: bool = False,
+        **kwargs,
+    ):
         super().__init__()
         self.head_dim = head_dim
         self.num_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
         self.attn_type = attn_type
+        self.rwkv_mem_delta_heads = tuple(rwkv_mem_delta_heads)
+        self.rwkv_mem_separate_delta_projections = rwkv_mem_separate_delta_projections
+        unknown_delta_heads = set(self.rwkv_mem_delta_heads) - {"q", "o"}
+        if unknown_delta_heads:
+            raise ValueError(f"Unknown RWKV memory delta heads: {sorted(unknown_delta_heads)}")
 
         self.gqkv_proj = LinearInit(hidden_size, self.head_dim, batch_out_features=(2 * self.num_heads + 2 * self.num_key_value_heads, ),
                                    bias=False, init_std=init_std_in, **kwargs)
         self.o_proj = LinearInit(head_dim * num_heads, hidden_size,
                                  bias=False, init_std=init_std_out, **kwargs)
+        self.rwkv_mem = None
+        self.rwkv_mem_q_proj = None
+        self.rwkv_mem_o_proj = None
+        if rwkv_mem_enabled:
+            from models.rwkv_memory import RWKVStateMemory
+
+            cpu_rng_state = torch.random.get_rng_state()
+            cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() and torch.cuda.is_initialized() else None
+            try:
+                self.rwkv_mem = RWKVStateMemory(
+                    max_seq_len=max_seq_len,
+                    hidden_size=hidden_size,
+                    head_size=rwkv_mem_head_size,
+                    backend=rwkv_mem_backend,
+                    chunk_len=rwkv_mem_chunk_len,
+                    scale=rwkv_mem_scale,
+                    output_init=rwkv_mem_output_init,
+                    output_init_scale=rwkv_mem_output_init_scale,
+                )
+                if rwkv_mem_separate_delta_projections:
+                    if "q" in self.rwkv_mem_delta_heads:
+                        self.rwkv_mem_q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+                        nn.init.eye_(self.rwkv_mem_q_proj.weight)
+                    if "o" in self.rwkv_mem_delta_heads:
+                        self.rwkv_mem_o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+                        nn.init.eye_(self.rwkv_mem_o_proj.weight)
+            finally:
+                torch.random.set_rng_state(cpu_rng_state)
+                if cuda_rng_states is not None:
+                    torch.cuda.set_rng_state_all(cuda_rng_states)
+
+    def _should_run_rwkv_mem(self, hidden_states: Tensor, cache: Optional[Cache]) -> bool:
+        # Cached generation prefill passes the full prompt with cache allocated.
+        # Single-token decode still needs persistent RWKV state, so skip it.
+        return self.rwkv_mem is not None and (cache is None or hidden_states.shape[-2] > 1)
 
     def forward(self, hidden_states: Tensor, cos_sin: Optional[CosSin], cache: Optional[Cache] = None, cache_lengths: Optional[Tensor] = None, **seq_info) -> Tensor:
         # hidden_states, gqkv: [..., seq_len, hidden_size]
@@ -163,6 +223,14 @@ class Attention(nn.Module):
         # Split head (last dimension of projected qkv)
         gqkv = rearrange(gqkv, "... (h hd) -> ... h hd", h=2 * self.num_heads + 2 * self.num_key_value_heads)
         gate, query, key, value = gqkv.split((self.num_heads, self.num_heads, self.num_key_value_heads, self.num_key_value_heads), dim=-2)
+
+        rwkv_mem_delta = None
+        if self._should_run_rwkv_mem(hidden_states, cache):
+            rwkv_mem_delta = self.rwkv_mem(hidden_states, **seq_info)  # type: ignore[operator]
+            if "q" in self.rwkv_mem_delta_heads:
+                q_delta = self.rwkv_mem_q_proj(rwkv_mem_delta) if self.rwkv_mem_q_proj is not None else rwkv_mem_delta
+                query = query + rearrange(q_delta, "... (h hd) -> ... h hd", h=self.num_heads)
+
         # query, key, value: [..., seq_len, num_heads, head_dim]
         # RoPE
         if cos_sin is not None:
@@ -187,7 +255,11 @@ class Attention(nn.Module):
 
         # attn_output: [..., seq_len, num_heads, head_dim]
         attn_output = rearrange(torch.sigmoid(gate) * attn_output, "... h hd -> ... (h hd)")  # type: ignore
-        return self.o_proj(attn_output)
+        out = self.o_proj(attn_output)
+        if rwkv_mem_delta is not None and "o" in self.rwkv_mem_delta_heads:
+            o_delta = self.rwkv_mem_o_proj(rwkv_mem_delta) if self.rwkv_mem_o_proj is not None else rwkv_mem_delta
+            out = out + o_delta
+        return out
 
 
 class SwiGLU(nn.Module):

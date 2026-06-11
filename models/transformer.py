@@ -38,6 +38,16 @@ class TransformerConfig(BaseModel):
     pos_emb_type: Literal["rope", "none"]
     rope_theta: Optional[float] = None
 
+    rwkv_mem_enabled: bool = False
+    rwkv_mem_head_size: int = 64
+    rwkv_mem_backend: Literal["auto", "cuda", "torch"] = "auto"
+    rwkv_mem_chunk_len: int = 16
+    rwkv_mem_scale: float = 1.0
+    rwkv_mem_output_init: Literal["zero", "small"] = "zero"
+    rwkv_mem_output_init_scale: float = 0.02
+    rwkv_mem_delta_heads: tuple[str, ...] = ("o",)
+    rwkv_mem_separate_delta_projections: bool = False
+
     # [Computed properties]
     @property
     def intermediate_size(self):
@@ -71,9 +81,19 @@ class TransformerBlock(nn.Module):
             num_heads=config.num_heads,
             num_key_value_heads=config.num_heads,
             attn_type=config.attn_type,
+            max_seq_len=config.max_seq_len,
 
             init_std_in=config.init_config.in_std,
-            init_std_out=config.init_config.attn_out_std
+            init_std_out=config.init_config.attn_out_std,
+            rwkv_mem_enabled=config.rwkv_mem_enabled,
+            rwkv_mem_head_size=config.rwkv_mem_head_size,
+            rwkv_mem_backend=config.rwkv_mem_backend,
+            rwkv_mem_chunk_len=config.rwkv_mem_chunk_len,
+            rwkv_mem_scale=config.rwkv_mem_scale,
+            rwkv_mem_output_init=config.rwkv_mem_output_init,
+            rwkv_mem_output_init_scale=config.rwkv_mem_output_init_scale,
+            rwkv_mem_delta_heads=config.rwkv_mem_delta_heads,
+            rwkv_mem_separate_delta_projections=config.rwkv_mem_separate_delta_projections,
         )
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,

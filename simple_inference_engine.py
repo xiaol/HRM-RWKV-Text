@@ -40,7 +40,21 @@ class InferenceCheckpoint:
         return self.tokenizer.decode(tokens)  # pyright: ignore[reportReturnType]
 
 
-def inference_load_checkpoint(ckpt_path: str, ckpt_epoch: Optional[int], ckpt_use_ema: bool):
+def _detect_checkpoint_tag(ckpt_path: str) -> str:
+    ckpt_files = glob(os.path.join(ckpt_path, "fsdp2_epoch_*"))
+    if ckpt_files:
+        epoch = max(int(Path(f).stem.split("_")[-1]) for f in ckpt_files)
+        return f"epoch_{epoch}"
+
+    ckpt_files = glob(os.path.join(ckpt_path, "fsdp2_step_*"))
+    if ckpt_files:
+        step = max(int(Path(f).stem.split("_")[-1]) for f in ckpt_files)
+        return f"step_{step}"
+
+    raise ValueError(f"No checkpoint files found in {ckpt_path}")
+
+
+def inference_load_checkpoint(ckpt_path: str, ckpt_epoch: Optional[int], ckpt_use_ema: bool, ckpt_tag: Optional[str] = None):
     # Load Checkpoint
     # Load config
     with open(os.path.join(ckpt_path, "all_config.yaml"), "r") as f:
@@ -75,31 +89,37 @@ def inference_load_checkpoint(ckpt_path: str, ckpt_epoch: Optional[int], ckpt_us
             tokenizer_info=train_metadata.tokenizer_info
         )
 
-    # Optimizer (ONLY for loading DCP training states)
-    optim = AdamATan2(model.parameters(),
-                    lr=torch.tensor(0.0, dtype=torch.get_default_dtype(), device="cpu"),
-                    betas=(model_cfg.beta1, model_cfg.beta2),
-                    weight_decay=model_cfg.weight_decay,
-                    ema=model_cfg.ema)
-    
-    # Detect checkpoint epoch if not specified
-    if ckpt_epoch is None:
-        ckpt_files = glob(os.path.join(ckpt_path, "fsdp2_epoch_*"))
-        if len(ckpt_files) == 0:
-            raise ValueError(f"No checkpoint files found in {ckpt_path}")
+    if ckpt_tag is None:
+        if ckpt_epoch is not None:
+            ckpt_tag = f"epoch_{ckpt_epoch}"
+        else:
+            ckpt_tag = _detect_checkpoint_tag(ckpt_path)
+            print(f"Detected latest checkpoint tag: {ckpt_tag}")
 
-        ckpt_epoch = max(int(Path(f).stem.split("_")[-1]) for f in ckpt_files)
-        print(f"Detected latest checkpoint epoch: {ckpt_epoch}")
+    needs_optimizer = ckpt_use_ema and model_cfg.ema is not None
+    optim = None
+    state = {"model": model.state_dict()}
+    if needs_optimizer:
+        # Optimizer is only needed to swap EMA weights into the model.
+        optim = AdamATan2(
+            model.parameters(),
+            lr=torch.tensor(0.0, dtype=torch.get_default_dtype(), device="cpu"),
+            betas=(model_cfg.beta1, model_cfg.beta2),
+            weight_decay=model_cfg.weight_decay,
+            ema=model_cfg.ema,
+        )
+        state["optim"] = get_optimizer_state_dict(model, optim)  # pyright: ignore[reportArgumentType]
 
-    # Load checkpoint
-    dcp.load({"model": model.state_dict(), "optim": get_optimizer_state_dict(model, optim)},  # pyright: ignore[reportPrivateImportUsage]
-        checkpoint_id=os.path.join(ckpt_path, f"fsdp2_epoch_{ckpt_epoch}"),
+    dcp.load(
+        state,
+        checkpoint_id=os.path.join(ckpt_path, f"fsdp2_{ckpt_tag}"),
         no_dist=True  # <--- Critical for single rank loading
     )
-    carry = torch.load(os.path.join(ckpt_path, f"carry_epoch_{ckpt_epoch}.0.pt"), map_location="cuda")
+    carry = torch.load(os.path.join(ckpt_path, f"carry_{ckpt_tag}.0.pt"), map_location="cuda")
 
     # Use EMA weights
-    if ckpt_use_ema:
+    if needs_optimizer:
+        assert optim is not None
         optim.swap_ema()
     # Cast to fwd dtype & eval mode
     model = model.to(getattr(torch, model_cfg.fwd_bwd_dtype)).eval()

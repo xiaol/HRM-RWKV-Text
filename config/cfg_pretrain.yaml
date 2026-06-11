@@ -38,3 +38,4 @@ max_steps: null
 save_checkpoints: true
 log_interval: 5
 loss_history_path: null
+trainable_param_substrings: null

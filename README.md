@@ -16,6 +16,27 @@ Fork repository:
 https://github.com/xiaol/HRM-RWKV-Text
 ```
 
+## Status
+
+The direct HRM-H Transformer to RWKV-7 migration direction is archived as of 2026-06-11.
+
+Best MMLU result from the early hidden-state alignment checkpoint was `0.3048` with `0.1175` invalid. The later corrected PrefixLM-masked CE/KL stage3 run improved invalid answers to `0.0126`, but MMLU dropped to `0.2945`. The HRM-Text-1B teacher reference was `0.6088`.
+
+Conclusion: continuing the same stage3 recipe is not recommended. The implementation and logs remain in this repo for reference, but this direction is no longer the active path.
+
+Detailed archive note:
+
+```text
+docs/archive_hrm_h_rwkv7_alignment.md
+```
+
+Current accepted direction:
+
+```text
+docs/next_delta_mem_direction.md
+docs/rwkv_mem_posttrain_mmlu_plan.md
+```
+
 ## What Changed
 
 Added HRM core variants:
@@ -26,6 +47,9 @@ Added HRM core variants:
 | `rwkv7` / `hrm_rwkv7` | RWKV-7 | RWKV-7 |
 | `hybrid_h_rwkv7` / `hrm_h_rwkv7` | RWKV-7 | Transformer |
 | `hybrid_l_rwkv7` / `hrm_l_rwkv7` | Transformer | RWKV-7 |
+| `rwkv_mem` / `hrm_h_rwkv_mem` | Transformer + RWKV-state memory | Transformer |
+| `hrm_l_rwkv_mem` | Transformer | Transformer + RWKV-state memory |
+| `hrm_hl_rwkv_mem` | Transformer + RWKV-state memory | Transformer + RWKV-state memory |
 
 Key files:
 
@@ -33,9 +57,11 @@ Key files:
 models/rwkv7.py
 models/baselines/hrm_rwkv7_nocarry_bp_warmup.py
 models/baselines/hrm_hybrid_rwkv7_nocarry_bp_warmup.py
+models/rwkv_memory.py
 config/arch/net/hrm_rwkv7.yaml
 config/arch/net/hrm_h_rwkv7.yaml
 config/arch/net/hrm_l_rwkv7.yaml
+config/arch/net/hrm_h_rwkv_mem.yaml
 scripts/benchmark_hrm_rwkv7.py
 scripts/prepare_hf_subset_data.py
 ```
@@ -134,6 +160,161 @@ Current result after batching packed RWKV sequences:
 | `hybrid_l_rwkv7` | 40.71M | 15,242 | 2,012 | 4.9637 | 3.4560 | 3.5877 | 4.77 GB |
 
 This is a short training-process validation run, not a final model-quality result.
+
+## RWKV-State Memory Adapter
+
+The active post-archive direction keeps the HRM Transformer H/L cores and adds an optional RWKV-7 state memory path inside `Attention`:
+
+```text
+memory = rwkv7_state_reader(hidden)
+query = query + delta_q(memory)
+attention_out = transformer_attention(query, key, value)
+output = attention_out + delta_o(memory)
+```
+
+For `rwkv_mem_output_init=zero`, the adapter starts as an exact Transformer baseline: both memory deltas are zero and adapter construction restores RNG state so later Transformer layers initialize identically. New runs use `rwkv_mem_delta_heads: [q, o]` with separate identity-initialized `delta_q`/`delta_o` projections, so the query-side and output-side effects can diverge during post-training. This gives a clean continuation path from an HRM-Text Transformer checkpoint while still allowing the RWKV state to learn a transformation.
+
+### Method Details
+
+The adapter is intentionally not a replacement of the HRM Transformer core. The direct H-level Transformer-to-RWKV migration was archived because hidden-state alignment and CE/KL continuation did not preserve MMLU. This method keeps the original HRM-Text-1B Transformer weights frozen and adds a trainable online memory path only inside H-level attention.
+
+The forward pass is:
+
+```text
+x_norm = norm(hidden)
+gate, q0, k, v = transformer_qkv(x_norm)
+memory = rwkv7_state_memory(x_norm)
+q = q0 + delta_q(memory)
+attn = attention(q, k, v)
+out = o_proj(gate * attn) + delta_o(memory)
+```
+
+Important implementation choices:
+
+```text
+rwkv_mem_output_init: zero
+rwkv_mem_delta_heads: [q, o]
+rwkv_mem_separate_delta_projections: true
+rwkv_mem_backend: cuda
+trainable_param_substrings: [rwkv_mem]
+```
+
+Zero initialization makes the first forward pass exactly match the teacher checkpoint. The RWKV memory output is initially zero, while `delta_q` and `delta_o` are identity-initialized. That means `q` and `out` are unchanged at step 0, but gradients can immediately train the RWKV memory and the two delta projections.
+
+The `q` path is the main difference from an output-only residual adapter. Adding `delta_q(memory)` before RoPE and attention changes the attention distribution itself, so the online RWKV state can steer which historical tokens the Transformer attends to. Adding `delta_o(memory)` after attention gives a direct memory residual into the block output. These two effects are separate projections so training does not force the same memory transform to serve both roles.
+
+The current implementation runs RWKV memory during full-prompt prefill. That is enough for MMLU in this repo because MMLU is a one-token multiple-choice generation benchmark: the answer logits come from the prompt prefill. Long-form autoregressive generation still needs persistent RWKV memory decode state before it should be treated as a target benchmark.
+
+First H-only V1 comparison on RTX 4090:
+
+```bash
+.venv/bin/python scripts/benchmark_hrm_rwkv7.py \
+  --mode v1 \
+  --archs transformer,rwkv_mem \
+  --device cuda \
+  --dtype bf16 \
+  --warmup-steps 2 \
+  --steps 20 \
+  --v1-batch-tokens 2048 \
+  --v1-eval-batch-tokens 2048 \
+  --v1-val-batches 10 \
+  --seq-len 4096 \
+  --hidden-size 256 \
+  --n-layers 4 \
+  --half-layers \
+  --num-heads 4 \
+  --expansion 4.0 \
+  --h-cycles 2 \
+  --l-cycles 3 \
+  --bp-steps 5 \
+  --vocab-size 65536 \
+  --rwkv-mem-backend auto \
+  --rwkv-mem-output-init zero \
+  --json-out outputs/rwkv_mem_v1_compare_zero.json
+```
+
+| arch | params | tok/s | supervised tok/s | train mean CE | last CE | val CE | VRAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `transformer` | 37.22M | 10,299 | 1,429 | 6.6394 | 4.8207 | 4.8887 | 2.04 GB |
+| `rwkv_mem` | 37.89M | 10,523 | 1,460 | 6.6272 | 4.8087 | 4.8785 | 2.41 GB |
+
+This is only a short baseline validation, but it confirms the RWKV-state memory path trains, uses the CUDA-eligible RWKV recurrence, and slightly beats the matched Transformer baseline in this run.
+
+### Post-Train To MMLU Target
+
+The current target is no longer just validation CE. Start from the original HRM-Text-1B checkpoint, post-train the new H-level RWKV-memory adapter on the prepared HRM dataset, and use MMLU as the acceptance metric.
+
+Baseline:
+
+```text
+teacher checkpoint: /run/media/xiaol/B214449214445C0B/hrm_text_eval_checkpoints/hrm_text_1b_teacher
+teacher MMLU: 0.6088
+```
+
+Best current post-train result:
+
+| model | MMLU | invalid | delta vs teacher |
+| --- | ---: | ---: | ---: |
+| HRM-Text-1B teacher | 0.6088 | 0.0005 | - |
+| H RWKV-memory `step_200` | 0.6092 | 0.0006 | +0.0004 |
+
+```text
+checkpoint: /run/media/xiaol/B214449214445C0B/hrm_text_pretrain_checkpoints/rwkv_mem_posttrain/rwkv_mem_qo_sep_full_s200_20260611_111851
+ckpt_tag: step_200
+```
+
+Result artifacts:
+
+```text
+MMLU log: /run/media/xiaol/B214449214445C0B/hrm_text_pretrain_logs/rwkv_mem_posttrain/rwkv_mem_qo_sep_full_s200_20260611_111851.mmlu.log
+MMLU JSON: /run/media/xiaol/B214449214445C0B/hrm_text_eval_runs/rwkv_mem_posttrain/rwkv_mem_qo_sep_full_s200_20260611_111851_step_200.mmlu.json
+```
+
+Primary launch:
+
+```bash
+bash scripts/run_rwkv_mem_posttrain_mmlu.sh
+```
+
+Default recipe:
+
+```text
+data: /run/media/xiaol/B214449214445C0B/hrm_text_full_v1
+init: /run/media/xiaol/B214449214445C0B/hrm_text_eval_checkpoints/hrm_text_1b_teacher/model.safetensors
+trainable params: rwkv_mem only
+arch size: XL / HRM-Text-1B shape
+rwkv_mem_delta_heads: [q, o]
+rwkv_mem_separate_delta_projections: true
+global_batch_size: 196608
+micro_batch_size: 512
+gradient accumulation: 384
+optimizer steps: 200
+training-token exposure: 39,321,600
+trainable adapter params: 245,686,272
+total params: 1,428,480,000
+lr: 2e-4
+MMLU target: > 0.6088
+```
+
+The run reads from the complete prepared `176.24B`-token corpus, but the 200-step experiment is only a `39.3M`-token continuation, not a full epoch over that corpus.
+
+For quick iteration:
+
+```bash
+DATA_PATH=/run/media/xiaol/B214449214445C0B/hrm_text_10b_v1 \
+MAX_STEPS=200 \
+bash scripts/run_rwkv_mem_posttrain_mmlu.sh
+```
+
+MMLU is a one-token MCQ generation benchmark in this repo. `rwkv_mem` is active during cached full-prompt prefill, so MMLU logits use the adapter. Long-form generation still needs persistent RWKV-memory state for decode before it should be used as a target.
+
+### Reflection
+
+The useful lesson is that preserving the Transformer backbone matters more than forcing a full architectural swap. Directly replacing H with RWKV-7 created a much larger distribution shift and did not recover MMLU, even when hidden-state losses looked good. The memory-adapter route is smaller and more conservative: it starts from exactly the teacher behavior, then lets RWKV state learn a side-channel transformation.
+
+The result is technically positive but small. The accepted run improved MMLU from `0.6088` to `0.6092`, with invalid rate `0.0006`. This clears the stated benchmark target, but the margin is not large enough to claim a robust model-quality win without repeated seeds or longer sweeps. Treat it as a working proof that the training path, checkpoint loading, CUDA RWKV memory, and MMLU gate are valid.
+
+The next serious iteration should focus on robustness rather than only chasing a single score: repeat the `step_200` recipe with another seed, try lower LR such as `1e-4`, and evaluate intermediate checkpoints if MMLU begins to regress after CE improves. Persistent decode state is also required before using this adapter for long-form generation metrics.
 
 ## Original HRM-Text Evaluation
 

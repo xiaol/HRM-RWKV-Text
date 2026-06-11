@@ -31,6 +31,12 @@ HYBRID_ARCHS = {
     "hybrid_l_rwkv7": ("transformer", "rwkv7"),
 }
 
+RWKV_MEM_ARCHS = {
+    "hrm_h_rwkv_mem": (True, False, "transformer+rwkv_mem", "transformer"),
+    "hrm_l_rwkv_mem": (False, True, "transformer", "transformer+rwkv_mem"),
+    "hrm_hl_rwkv_mem": (True, True, "transformer+rwkv_mem", "transformer+rwkv_mem"),
+}
+
 
 ARCH_ALIASES = {
     "hybrid_h": "hybrid_h_rwkv7",
@@ -39,6 +45,13 @@ ARCH_ALIASES = {
     "hybrid_l": "hybrid_l_rwkv7",
     "l_rwkv7": "hybrid_l_rwkv7",
     "rwkv7_l": "hybrid_l_rwkv7",
+    "rwkv_mem": "hrm_h_rwkv_mem",
+    "h_rwkv_mem": "hrm_h_rwkv_mem",
+    "rwkv_mem_h": "hrm_h_rwkv_mem",
+    "l_rwkv_mem": "hrm_l_rwkv_mem",
+    "rwkv_mem_l": "hrm_l_rwkv_mem",
+    "hl_rwkv_mem": "hrm_hl_rwkv_mem",
+    "rwkv_mem_hl": "hrm_hl_rwkv_mem",
 }
 
 
@@ -132,17 +145,53 @@ def normalize_arch(arch: str) -> str:
 
 
 def _uses_rwkv7(arch: str) -> bool:
-    return arch == "rwkv7" or arch in HYBRID_ARCHS
+    return arch == "rwkv7" or arch in HYBRID_ARCHS or arch in RWKV_MEM_ARCHS
+
+
+def _uses_rwkv_mem(arch: str) -> bool:
+    return arch in RWKV_MEM_ARCHS
+
+
+def _arch_level_labels(arch: str) -> tuple[str, str]:
+    if arch in HYBRID_ARCHS:
+        return HYBRID_ARCHS[arch]
+    if arch in RWKV_MEM_ARCHS:
+        return RWKV_MEM_ARCHS[arch][2], RWKV_MEM_ARCHS[arch][3]
+    return arch, arch
 
 
 def _rwkv7_full_channel_cuda_eligible(args: argparse.Namespace, arch: str) -> bool:
     return (
         _uses_rwkv7(arch)
+        and not _uses_rwkv_mem(arch)
         and args.rwkv7_backend != "torch"
         and args.dtype == "bf16"
         and args.rwkv7_head_size == 64
         and math.isclose(args.rwkv7_expansion if args.rwkv7_expansion is not None else args.expansion, 1.0)
     )
+
+
+def _rwkv_mem_cuda_eligible(args: argparse.Namespace, arch: str) -> bool:
+    return (
+        _uses_rwkv_mem(arch)
+        and args.rwkv_mem_backend != "torch"
+        and args.dtype == "bf16"
+        and args.rwkv_mem_head_size == 64
+    )
+
+
+def _rwkv_mem_config(args: argparse.Namespace) -> dict:
+    return {
+        "rwkv_mem_enabled": True,
+        "rwkv_mem_head_size": args.rwkv_mem_head_size,
+        "rwkv_mem_backend": args.rwkv_mem_backend,
+        "rwkv_mem_chunk_len": args.rwkv_mem_chunk_len,
+        "rwkv_mem_scale": args.rwkv_mem_scale,
+        "rwkv_mem_output_init": args.rwkv_mem_output_init,
+        "rwkv_mem_output_init_scale": args.rwkv_mem_output_init_scale,
+        "rwkv_mem_delta_heads": tuple(x.strip() for x in args.rwkv_mem_delta_heads.split(",") if x.strip()),
+        "rwkv_mem_separate_delta_projections": args.rwkv_mem_separate_delta_projections,
+    }
 
 
 def common_config(args: argparse.Namespace, arch: str) -> dict:
@@ -186,6 +235,13 @@ def common_config(args: argparse.Namespace, arch: str) -> dict:
                 "rwkv7_enable_v_first_mix": True,
             }
         )
+    if arch in RWKV_MEM_ARCHS:
+        h_mem, l_mem = RWKV_MEM_ARCHS[arch][:2]
+        mem_cfg = _rwkv_mem_config(args)
+        if l_mem:
+            cfg.update(mem_cfg)
+        if h_mem:
+            cfg["H_override"] = cfg["H_override"] | mem_cfg
     return cfg
 
 
@@ -195,7 +251,7 @@ def build_model(args: argparse.Namespace, arch: str, device: torch.device) -> to
         model_cls = HierarchicalRWKV7Model
     elif arch in HYBRID_ARCHS:
         model_cls = HierarchicalHybridRWKV7Model
-    elif arch == "transformer":
+    elif arch == "transformer" or arch in RWKV_MEM_ARCHS:
         model_cls = HierarchicalReasoningModel
     else:
         raise ValueError(f"Unknown arch: {arch}")
@@ -417,10 +473,11 @@ def run_arch(args: argparse.Namespace, arch: str, files: List[Path], device: tor
     elapsed = time.perf_counter() - (timed_start or time.perf_counter())
     tokens = args.steps * args.batch_size * args.seq_len
     final_val = evaluate_named_sets(args, model, device) if args.val_patterns and args.final_val else {}
+    h_arch, l_arch = _arch_level_labels(arch)
     return {
         "arch": arch,
-        "H_arch": HYBRID_ARCHS.get(arch, (arch, arch))[0],
-        "L_arch": HYBRID_ARCHS.get(arch, (arch, arch))[1],
+        "H_arch": h_arch,
+        "L_arch": l_arch,
         "params": count_params(model),
         "init_from_safetensors": args.init_from_safetensors,
         "init_loaded_tensors": getattr(args, "_init_loaded_tensors", 0),
@@ -430,6 +487,8 @@ def run_arch(args: argparse.Namespace, arch: str, files: List[Path], device: tor
         "transformer_expansion": args.transformer_expansion if args.transformer_expansion is not None else args.expansion,
         "rwkv7_expansion": args.rwkv7_expansion if args.rwkv7_expansion is not None else args.expansion,
         "rwkv7_full_channel_cuda_eligible": _rwkv7_full_channel_cuda_eligible(args, arch),
+        "rwkv_mem_cuda_eligible": _rwkv_mem_cuda_eligible(args, arch),
+        "rwkv_mem_output_init": args.rwkv_mem_output_init if _uses_rwkv_mem(arch) else "",
         "steps": args.steps,
         "tokens": tokens,
         "first_loss": losses[0],
@@ -516,10 +575,11 @@ def run_v1_arch(args: argparse.Namespace, arch: str, device: torch.device) -> di
     total_tokens = sum(token_counts)
     supervised_tokens = sum(supervised_counts)
     v1_val_loss = evaluate_v1_loss(args, model, device, args.v1_val_batches) if args.v1_val_batches > 0 else {}
+    h_arch, l_arch = _arch_level_labels(arch)
     return {
         "arch": arch,
-        "H_arch": HYBRID_ARCHS.get(arch, (arch, arch))[0],
-        "L_arch": HYBRID_ARCHS.get(arch, (arch, arch))[1],
+        "H_arch": h_arch,
+        "L_arch": l_arch,
         "params": count_params(model),
         "init_from_safetensors": args.init_from_safetensors,
         "init_loaded_tensors": getattr(args, "_init_loaded_tensors", 0),
@@ -529,6 +589,8 @@ def run_v1_arch(args: argparse.Namespace, arch: str, device: torch.device) -> di
         "transformer_expansion": args.transformer_expansion if args.transformer_expansion is not None else args.expansion,
         "rwkv7_expansion": args.rwkv7_expansion if args.rwkv7_expansion is not None else args.expansion,
         "rwkv7_full_channel_cuda_eligible": _rwkv7_full_channel_cuda_eligible(args, arch),
+        "rwkv_mem_cuda_eligible": _rwkv_mem_cuda_eligible(args, arch),
+        "rwkv_mem_output_init": args.rwkv_mem_output_init if _uses_rwkv_mem(arch) else "",
         "steps": args.steps,
         "tokens": total_tokens,
         "supervised_tokens": supervised_tokens,
@@ -584,6 +646,14 @@ def main() -> None:
     parser.add_argument("--rwkv7-head-size", type=int, default=64)
     parser.add_argument("--rwkv7-backend", default="auto", choices=["auto", "cuda", "torch"])
     parser.add_argument("--rwkv7-chunk-len", type=int, default=16)
+    parser.add_argument("--rwkv-mem-head-size", type=int, default=64)
+    parser.add_argument("--rwkv-mem-backend", default="auto", choices=["auto", "cuda", "torch"])
+    parser.add_argument("--rwkv-mem-chunk-len", type=int, default=16)
+    parser.add_argument("--rwkv-mem-scale", type=float, default=1.0)
+    parser.add_argument("--rwkv-mem-output-init", default="zero", choices=["zero", "small"])
+    parser.add_argument("--rwkv-mem-output-init-scale", type=float, default=0.02)
+    parser.add_argument("--rwkv-mem-delta-heads", default="q,o", help="Comma-separated RWKV memory injection points: q,o")
+    parser.add_argument("--rwkv-mem-separate-delta-projections", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1234)
@@ -616,13 +686,14 @@ def main() -> None:
             results.append(run_arch(args, arch, files, device))
             clear_cuda_cache(device)
 
-        print("arch,H_arch,L_arch,params,expansion,transformer_expansion,rwkv7_expansion,rwkv7_full_channel_cuda_eligible,tokens_per_second,first_loss,last_loss,loss_delta,mean_loss,peak_memory_mb,val_loss")
+        print("arch,H_arch,L_arch,params,expansion,transformer_expansion,rwkv7_expansion,rwkv7_full_channel_cuda_eligible,rwkv_mem_cuda_eligible,tokens_per_second,first_loss,last_loss,loss_delta,mean_loss,peak_memory_mb,val_loss")
         for result in results:
             peak = "" if result["peak_memory_mb"] is None else f"{result['peak_memory_mb']:.2f}"
             val = ";".join(f"{name}:{value['mean_loss']:.6f}" for name, value in result["val_loss"].items())
             print(
                 f"{result['arch']},{result['H_arch']},{result['L_arch']},{result['params']},{result['expansion']:.6f},"
-                f"{result['transformer_expansion']:.6f},{result['rwkv7_expansion']:.6f},{result['rwkv7_full_channel_cuda_eligible']},{result['tokens_per_second']:.2f},"
+                f"{result['transformer_expansion']:.6f},{result['rwkv7_expansion']:.6f},{result['rwkv7_full_channel_cuda_eligible']},"
+                f"{result['rwkv_mem_cuda_eligible']},{result['tokens_per_second']:.2f},"
                 f"{result['first_loss']:.6f},{result['last_loss']:.6f},{result['loss_delta']:.6f},"
                 f"{result['mean_loss']:.6f},{peak},{val}"
             )
@@ -632,13 +703,13 @@ def main() -> None:
             results.append(run_v1_arch(args, arch, device))
             clear_cuda_cache(device)
 
-        print("arch,H_arch,L_arch,params,rwkv7_full_channel_cuda_eligible,tokens_per_second,supervised_tokens_per_second,first_loss,last_loss,loss_delta,mean_loss,val_loss,peak_memory_mb")
+        print("arch,H_arch,L_arch,params,rwkv7_full_channel_cuda_eligible,rwkv_mem_cuda_eligible,tokens_per_second,supervised_tokens_per_second,first_loss,last_loss,loss_delta,mean_loss,val_loss,peak_memory_mb")
         for result in results:
             peak = "" if result["peak_memory_mb"] is None else f"{result['peak_memory_mb']:.2f}"
             val = "" if not result["v1_val_loss"] else f"{result['v1_val_loss']['mean_loss']:.6f}"
             print(
                 f"{result['arch']},{result['H_arch']},{result['L_arch']},{result['params']},"
-                f"{result['rwkv7_full_channel_cuda_eligible']},{result['tokens_per_second']:.2f},"
+                f"{result['rwkv7_full_channel_cuda_eligible']},{result['rwkv_mem_cuda_eligible']},{result['tokens_per_second']:.2f},"
                 f"{result['supervised_tokens_per_second']:.2f},{result['first_loss']:.6f},{result['last_loss']:.6f},"
                 f"{result['loss_delta']:.6f},{result['mean_loss']:.6f},{val},{peak}"
             )

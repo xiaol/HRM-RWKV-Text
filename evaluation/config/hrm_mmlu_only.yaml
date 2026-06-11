@@ -1,0 +1,19 @@
+engine: SimpleEngine
+ckpt_path: null
+
+generation_config:
+  batch_size: 1
+  max_context: 4096
+  temperature: 0.0
+  condition: direct
+
+benchmarks:
+  - name: MMLU
+    split: test
+    num_shots: 5
+    special_shots:
+      high_school_european_history: 3
+    generation_config:
+      batch_size: 1
+      max_context: 4096
+      condition: direct
