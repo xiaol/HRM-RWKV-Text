@@ -39,6 +39,7 @@ class TransformerConfig(BaseModel):
     rope_theta: Optional[float] = None
 
     rwkv_mem_enabled: bool = False
+    rwkv_mem_mode: Literal["delta_rule", "rwkv7_legacy"] = "delta_rule"
     rwkv_mem_head_size: int = 64
     rwkv_mem_backend: Literal["auto", "cuda", "torch"] = "auto"
     rwkv_mem_chunk_len: int = 16
@@ -47,6 +48,13 @@ class TransformerConfig(BaseModel):
     rwkv_mem_output_init_scale: float = 0.02
     rwkv_mem_delta_heads: tuple[str, ...] = ("o",)
     rwkv_mem_separate_delta_projections: bool = False
+    rwkv_mem_rank: int = 8
+    rwkv_mem_alpha: float = 16.0
+    rwkv_mem_beta_bias_init: float = -1.5
+    rwkv_mem_normalize_qk: bool = True
+    rwkv_mem_couple_lambda: bool = True
+    rwkv_mem_state_update_mode: Literal["standard", "lambda_outside", "no_lambda"] = "standard"
+    rwkv_mem_rankwise_gates: bool = True
 
     # [Computed properties]
     @property
@@ -86,6 +94,7 @@ class TransformerBlock(nn.Module):
             init_std_in=config.init_config.in_std,
             init_std_out=config.init_config.attn_out_std,
             rwkv_mem_enabled=config.rwkv_mem_enabled,
+            rwkv_mem_mode=config.rwkv_mem_mode,
             rwkv_mem_head_size=config.rwkv_mem_head_size,
             rwkv_mem_backend=config.rwkv_mem_backend,
             rwkv_mem_chunk_len=config.rwkv_mem_chunk_len,
@@ -94,6 +103,13 @@ class TransformerBlock(nn.Module):
             rwkv_mem_output_init_scale=config.rwkv_mem_output_init_scale,
             rwkv_mem_delta_heads=config.rwkv_mem_delta_heads,
             rwkv_mem_separate_delta_projections=config.rwkv_mem_separate_delta_projections,
+            rwkv_mem_rank=config.rwkv_mem_rank,
+            rwkv_mem_alpha=config.rwkv_mem_alpha,
+            rwkv_mem_beta_bias_init=config.rwkv_mem_beta_bias_init,
+            rwkv_mem_normalize_qk=config.rwkv_mem_normalize_qk,
+            rwkv_mem_couple_lambda=config.rwkv_mem_couple_lambda,
+            rwkv_mem_state_update_mode=config.rwkv_mem_state_update_mode,
+            rwkv_mem_rankwise_gates=config.rwkv_mem_rankwise_gates,
         )
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,

@@ -16,7 +16,9 @@ The archived H-RWKV direction changed the H-level transition operator too aggres
 
 Delta-Mem is a better conceptual direction because it keeps the full-attention backbone and adds a small online associative memory. For HRM-Text, that means we can preserve the Transformer H/L computation that gives the teacher its benchmark behavior, then test whether a stateful memory adapter improves or preserves reasoning while adding online state.
 
-The first implemented variant uses the repo's existing RWKV-7 state recurrence as that online memory. This avoids copying the upstream Delta-Mem implementation and lets the adapter use the local LT2 CUDA kernels.
+The first accepted experiment used the repo's existing RWKV-7 state recurrence as a q/o memory adapter. That was useful as a minimal proof of concept, but it was not the full delta-Mem mechanism.
+
+The current default implementation is now `rwkv_mem_mode: delta_rule`: a native HRM delta-rule associative memory that learns memory q/k/v projections, updates a compact online state, reads from that state, and injects q/k/v/o deltas into HRM attention. The old RWKV-7 reader remains available as `rwkv_mem_mode: rwkv7_legacy` for reproducing earlier checkpoints.
 
 ## What Delta-Mem Provides
 
@@ -44,12 +46,12 @@ config/arch/net/hrm_h_rwkv_mem.yaml
 
 Implemented adapter:
 
-- keep Transformer attention unchanged;
-- run a per-layer RWKV-7 state reader over the same hidden states;
-- inject the RWKV memory output into the attention query before RoPE/attention;
-- add the RWKV memory output as an attention-output residual after attention;
-- use separate identity-initialized `delta_q` and `delta_o` projections for new runs;
-- support packed PrefixLM batches by padding `[T, C]` into `[numseqs, max_len, C]`, running the RWKV state once, and scattering back;
+- keep the pretrained Transformer attention backbone;
+- project hidden states to low-rank memory `q/k/v`;
+- read from an online associative state before writing the current token;
+- update the state with delta-rule keep/erase/write coefficients;
+- inject the memory readout into attention `q/k/v/o`, with `[q, o]` as the default active head set to match the released delta-Mem adapter shape;
+- support packed PrefixLM batches by padding `[T, C]` into `[numseqs, max_len, C]`, scanning once, and scattering deltas back;
 - H-level only first through `H_override`.
 
 Recommended first config shape:
@@ -62,41 +64,44 @@ H_cycles: 2
 L_cycles: 3
 H_override:
   rwkv_mem_enabled: true
-  rwkv_mem_head_size: 64
-  rwkv_mem_backend: auto
-  rwkv_mem_chunk_len: 16
-  rwkv_mem_scale: 1.0
+  rwkv_mem_mode: delta_rule
+  rwkv_mem_rank: 8
+  rwkv_mem_alpha: 16.0
+  rwkv_mem_beta_bias_init: -1.5
+  rwkv_mem_state_update_mode: standard
   rwkv_mem_output_init: zero
   rwkv_mem_delta_heads: [q, o]
-  rwkv_mem_separate_delta_projections: true
+  rwkv_mem_separate_delta_projections: false
 bp_warmup_ratio: 0.2
 bp_max_steps: 5
 ```
 
-With `rwkv_mem_output_init=zero`, the model starts exactly as the Transformer baseline. Adapter construction restores RNG state after initializing RWKV parameters, so later Transformer layers keep identical initialization.
+With `rwkv_mem_output_init=zero`, the model starts exactly as the Transformer baseline because all delta heads output zero. Adapter construction restores RNG state after initializing memory parameters, so later Transformer layers keep identical initialization.
+
+Current limitation: the HRM-native delta-rule scan is functionally correct but currently uses a PyTorch token loop. Upstream delta-Mem uses a Triton affine-scan kernel for speed; porting or reimplementing that kernel is the next performance step.
 
 ## First Experiments
 
-1. Smoke-test tiny model with H-only RWKV-state memory.
+1. Smoke-test tiny model with H-only delta-rule memory.
 2. Run the existing short 40M validation benchmark against:
    - Transformer baseline
-   - H-only RWKV-state memory
-   - H+L RWKV-state memory
+   - H-only delta-rule memory
+   - H+L delta-rule memory
 3. Load HRM-Text-1B teacher weights with `strict=False` only for new RWKV-memory params, freeze the base Transformer, and train only memory parameters on the 1B subset.
 4. Evaluate MMLU before any long continuation.
 
 ## First Result
 
-H-only zero-init adapter on the 1B V1 subset, 20 timed steps, `hidden_size=256`, `n_layers=4`, `H_cycles=2`, `L_cycles=3`, `bp_steps=5`:
+Legacy H-only zero-init RWKV-state-reader adapter on the 1B V1 subset, 20 timed steps, `hidden_size=256`, `n_layers=4`, `H_cycles=2`, `L_cycles=3`, `bp_steps=5`:
 
 | arch | train mean CE | last CE | val CE |
 | --- | ---: | ---: | ---: |
 | `transformer` | 6.6394 | 4.8207 | 4.8887 |
 | `rwkv_mem` | 6.6272 | 4.8087 | 4.8785 |
 
-## Accepted Post-Train Result
+## Legacy Accepted Post-Train Result
 
-The H-level `q,o` RWKV-memory adapter was post-trained from the HRM-Text-1B teacher checkpoint for 200 optimizer steps on the prepared full HRM-Text corpus:
+The H-level `q,o` legacy RWKV-state-reader adapter was post-trained from the HRM-Text-1B teacher checkpoint for 200 optimizer steps on the prepared full HRM-Text corpus:
 
 ```text
 checkpoint: /run/media/xiaol/B214449214445C0B/hrm_text_pretrain_checkpoints/rwkv_mem_posttrain/rwkv_mem_qo_sep_full_s200_20260611_111851
@@ -107,7 +112,7 @@ invalid: 0.0006
 teacher MMLU: 0.6088
 ```
 
-This clears the target but with a small margin. Treat it as validation that the method is trainable and benchmark-compatible, not as a robust quality claim.
+This clears the target but with a small margin. Treat it as validation that the adapter-only training/evaluation path is benchmark-compatible, not as a result for the new full delta-rule memory implementation.
 
 ## Stop Criteria
 
@@ -121,4 +126,4 @@ Stop early if:
 
 Do not copy the upstream implementation directly unless licensing is clarified. The cloned repo does not include a top-level LICENSE file in the current checkout; it only advertises CC-BY-4.0 in the README badge.
 
-The HRM implementation should stay small and local. The current accepted path is `q,o` injection in the existing `Attention` module. Full Q/K/V/O delta-memory injection can be tested later, but it is more likely to disturb the pretrained Transformer path.
+The HRM implementation should stay small and local. The current default keeps active heads at `q,o` for the first comparison, but the implementation supports q/k/v/o delta heads for controlled ablations.

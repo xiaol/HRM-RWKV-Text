@@ -7,8 +7,8 @@ PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
 
 DATA_PATH="${DATA_PATH:-${DISK}/hrm_text_full_v1}"
 TEACHER_SAFETENSORS="${TEACHER_SAFETENSORS:-${DISK}/hrm_text_eval_checkpoints/hrm_text_1b_teacher/model.safetensors}"
-BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-${DISK}/hrm_text_pretrain_checkpoints/rwkv_mem_posttrain/rwkv_mem_qo_sep_full_s200_20260611_111851}"
-RUN_ID="${RUN_ID:-rwkv_mem_qo_sep_spare_600m}"
+BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-}"
+RUN_ID="${RUN_ID:-delta_mem_qo_spare_600m}"
 CKPT_DIR="${CKPT_DIR:-${DISK}/hrm_text_pretrain_checkpoints/rwkv_mem_posttrain/${RUN_ID}}"
 LOG_DIR="${LOG_DIR:-${DISK}/hrm_text_pretrain_logs/rwkv_mem_posttrain/${RUN_ID}}"
 PID_FILE="${PID_FILE:-${LOG_DIR}/train.pid}"
@@ -22,6 +22,12 @@ SESSION_STEPS="${SESSION_STEPS:-100}"
 SECONDS_PER_STEP="${SECONDS_PER_STEP:-46.5}"
 LR="${LR:-2e-4}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-20}"
+RWKV_MEM_MODE="${RWKV_MEM_MODE:-delta_rule}"
+RWKV_MEM_DELTA_HEADS="${RWKV_MEM_DELTA_HEADS:-[q,o]}"
+RWKV_MEM_RANK="${RWKV_MEM_RANK:-8}"
+RWKV_MEM_ALPHA="${RWKV_MEM_ALPHA:-16.0}"
+RWKV_MEM_BETA_BIAS_INIT="${RWKV_MEM_BETA_BIAS_INIT:--1.5}"
+RWKV_MEM_STATE_UPDATE_MODE="${RWKV_MEM_STATE_UPDATE_MODE:-standard}"
 
 latest_step_in() {
   local directory="$1"
@@ -107,7 +113,7 @@ start_training() {
   if [[ -n "$(latest_step_in "${CKPT_DIR}")" ]]; then
     resume_dir="${CKPT_DIR}"
     resume_tag="step_${step}"
-  elif [[ -d "${BOOTSTRAP_DIR}/fsdp2_step_${step}" && "${step}" -gt 0 ]]; then
+  elif [[ -n "${BOOTSTRAP_DIR}" && -d "${BOOTSTRAP_DIR}/fsdp2_step_${step}" && "${step}" -gt 0 ]]; then
     resume_dir="${BOOTSTRAP_DIR}"
     resume_tag="step_${step}"
   fi
@@ -139,9 +145,14 @@ start_training() {
     "loss_history_path=${LOSS_HISTORY}"
     log_interval=1
     resume_skip_data=true
+    "arch.H_override.rwkv_mem_mode=${RWKV_MEM_MODE}"
     arch.H_override.rwkv_mem_backend=cuda
-    "arch.H_override.rwkv_mem_delta_heads=[q,o]"
-    arch.H_override.rwkv_mem_separate_delta_projections=true
+    "arch.H_override.rwkv_mem_delta_heads=${RWKV_MEM_DELTA_HEADS}"
+    "arch.H_override.rwkv_mem_rank=${RWKV_MEM_RANK}"
+    "arch.H_override.rwkv_mem_alpha=${RWKV_MEM_ALPHA}"
+    "arch.H_override.rwkv_mem_beta_bias_init=${RWKV_MEM_BETA_BIAS_INIT}"
+    "arch.H_override.rwkv_mem_state_update_mode=${RWKV_MEM_STATE_UPDATE_MODE}"
+    arch.H_override.rwkv_mem_separate_delta_projections=false
   )
 
   if [[ -n "${resume_dir}" ]]; then

@@ -1,6 +1,6 @@
 # RWKV-Memory Post-Train Plan
 
-Objective: start from the original HRM-Text-1B Transformer checkpoint, add H-level RWKV-state memory, post-train on the prepared HRM dataset, and use MMLU as the primary acceptance benchmark.
+Objective: start from the original HRM-Text-1B Transformer checkpoint, add H-level delta-rule online memory, post-train on the prepared HRM dataset, and use MMLU as the primary acceptance benchmark.
 
 ## Baseline
 
@@ -57,9 +57,14 @@ arch: hrm_h_rwkv_mem
 size: XL
 init: original HRM-Text-1B model.safetensors
 trainable_param_substrings: [rwkv_mem]
+rwkv_mem_mode: delta_rule
+rwkv_mem_rank: 8
+rwkv_mem_alpha: 16.0
+rwkv_mem_beta_bias_init: -1.5
+rwkv_mem_state_update_mode: standard
 rwkv_mem_output_init: zero
 rwkv_mem_delta_heads: [q, o]
-rwkv_mem_separate_delta_projections: true
+rwkv_mem_separate_delta_projections: false
 rwkv_mem_backend: cuda
 global_batch_size: 196608
 micro_batch_size: 512
@@ -70,7 +75,7 @@ ema: null
 compile_train: false
 ```
 
-Why adapter-only first: zero-init makes the starting model identical to the original checkpoint, and adapter-only updates limit MMLU regression risk. The `q,o` injection matches the useful δ-mem structure more closely than output-only memory: `q` steers attention before the softmax and `o` adds a memory residual after attention. New runs use separate identity-initialized `delta_q` and `delta_o` projections so those two effects are not forced to share one projection after training. If MMLU improves or stays close while validation CE improves, Stage B can unfreeze more H-level parameters at a lower LR.
+Why adapter-only first: zero-init makes the starting model identical to the original checkpoint, and adapter-only updates limit MMLU regression risk. The default active heads remain `q,o` because the released delta-Mem adapter also uses Q/O, but the implementation now has the full memory-side recipe: learned memory q/k/v, delta-rule online state update, and optional q/k/v/o attention deltas. With zero delta heads, memory q/k/v gradients begin after the delta heads move off zero; use `rwkv_mem_output_init: small` only for experiments that do not require exact step-0 teacher equivalence. If MMLU improves or stays close while validation CE improves, Stage B can unfreeze more H-level parameters at a lower LR.
 
 ## Launch
 
@@ -110,7 +115,7 @@ bash scripts/eval_rwkv_mem_mmlu.sh "$CKPT_DIR" "step_$MAX_STEPS"
 `simple_inference_engine.py` now supports `ckpt_tag=step_N`, so max-step training checkpoints can be evaluated directly without converting to `model.safetensors`.
 `scripts/parse_mmlu_log.py` writes a compact JSON summary with `acc` and `invalid` for comparison against the `0.6088` teacher baseline.
 
-MMLU uses `max_tokens=1`. The RWKV-memory adapter is active during cached full-prompt prefill, so the one-token MCQ answer logits include the post-trained adapter. Single-token autoregressive decode still skips RWKV-memory until persistent RWKV state caching is added; this is acceptable for MMLU but not enough for long-form generation benchmarks.
+MMLU uses `max_tokens=1`. The memory adapter is active during cached full-prompt prefill, so the one-token MCQ answer logits include the post-trained adapter. Single-token autoregressive decode still skips memory updates until persistent memory state caching is added; this is acceptable for MMLU but not enough for long-form generation benchmarks.
 
 Validated smoke:
 
@@ -121,7 +126,17 @@ missing keys: rwkv_mem only
 trainable: 170,188,800 / 1,352,982,528 params
 checkpoint load: ckpt_tag=step_1
 one-token generation: passed
-next recipe default: q,o memory injection with separate delta projections
+next recipe default at that time: q,o legacy memory injection with separate delta projections
+```
+
+Updated implementation note:
+
+```text
+current default: rwkv_mem_mode=delta_rule
+memory state: learned low-rank q/k/v with keep/erase/write delta-rule scan
+active delta heads: q,o by default; k,v are supported for ablations
+legacy reproduction: set rwkv_mem_mode=rwkv7_legacy for the older RWKV-7 state-reader adapter
+performance caveat: the native HRM scan is currently a PyTorch loop, not the upstream Triton affine scan
 ```
 
 Completed baseline check:
@@ -136,7 +151,7 @@ result: matched teacher baseline, did not improve it
 json: /run/media/xiaol/B214449214445C0B/hrm_text_eval_runs/rwkv_mem_posttrain/rwkv_mem_posttrain_10b_s5_20260611_104539_step_5.mmlu.json
 ```
 
-Completed corrected run:
+Completed corrected legacy run:
 
 ```text
 run: rwkv_mem_qo_sep_full_s200_20260611_111851
@@ -155,7 +170,7 @@ MMLU acc: 0.6092
 MMLU invalid: 0.0006
 teacher MMLU acc: 0.6088
 delta vs teacher: +0.0004
-result: primary MMLU target met, invalid below required threshold; margin is small
+result: primary MMLU target met for the legacy RWKV-state adapter; margin is small
 mmlu_log: /run/media/xiaol/B214449214445C0B/hrm_text_pretrain_logs/rwkv_mem_posttrain/rwkv_mem_qo_sep_full_s200_20260611_111851.mmlu.log
 mmlu_json: /run/media/xiaol/B214449214445C0B/hrm_text_eval_runs/rwkv_mem_posttrain/rwkv_mem_qo_sep_full_s200_20260611_111851_step_200.mmlu.json
 ```

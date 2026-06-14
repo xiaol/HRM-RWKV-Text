@@ -50,7 +50,7 @@ resolve_init_safetensors() {
 
 INIT_SAFETENSORS="$(resolve_init_safetensors)"
 
-RUN_ID="${RUN_ID:-hrm_h_rwkv_mem_posttrain_mmlu_$(date +%Y%m%d_%H%M%S)}"
+RUN_ID="${RUN_ID:-hrm_h_delta_mem_qo_posttrain_mmlu_$(date +%Y%m%d_%H%M%S)}"
 CKPT_ROOT="${CKPT_ROOT:-${DISK}/hrm_text_pretrain_checkpoints/rwkv_mem_posttrain}"
 LOG_ROOT="${LOG_ROOT:-${DISK}/hrm_text_pretrain_logs/rwkv_mem_posttrain}"
 CKPT_DIR="${CKPT_DIR:-${CKPT_ROOT}/${RUN_ID}}"
@@ -70,7 +70,12 @@ LOG_INTERVAL="${LOG_INTERVAL:-1}"
 RUN_MMLU="${RUN_MMLU:-1}"
 TRAINABLE_PARAM_SUBSTRINGS="${TRAINABLE_PARAM_SUBSTRINGS:-[rwkv_mem]}"
 RWKV_MEM_DELTA_HEADS="${RWKV_MEM_DELTA_HEADS:-[q,o]}"
-RWKV_MEM_SEPARATE_DELTA_PROJECTIONS="${RWKV_MEM_SEPARATE_DELTA_PROJECTIONS:-true}"
+RWKV_MEM_MODE="${RWKV_MEM_MODE:-delta_rule}"
+RWKV_MEM_RANK="${RWKV_MEM_RANK:-8}"
+RWKV_MEM_ALPHA="${RWKV_MEM_ALPHA:-16.0}"
+RWKV_MEM_BETA_BIAS_INIT="${RWKV_MEM_BETA_BIAS_INIT:--1.5}"
+RWKV_MEM_STATE_UPDATE_MODE="${RWKV_MEM_STATE_UPDATE_MODE:-standard}"
+RWKV_MEM_SEPARATE_DELTA_PROJECTIONS="${RWKV_MEM_SEPARATE_DELTA_PROJECTIONS:-false}"
 
 mkdir -p "${CKPT_DIR}" "${LOG_ROOT}"
 
@@ -90,7 +95,12 @@ export TOKENIZERS_PARALLELISM=false
   echo "global_batch_size=${GLOBAL_BATCH_SIZE}"
   echo "micro_batch_size=${MICRO_BATCH_SIZE}"
   echo "trainable_param_substrings=${TRAINABLE_PARAM_SUBSTRINGS}"
+  echo "rwkv_mem_mode=${RWKV_MEM_MODE}"
   echo "rwkv_mem_delta_heads=${RWKV_MEM_DELTA_HEADS}"
+  echo "rwkv_mem_rank=${RWKV_MEM_RANK}"
+  echo "rwkv_mem_alpha=${RWKV_MEM_ALPHA}"
+  echo "rwkv_mem_beta_bias_init=${RWKV_MEM_BETA_BIAS_INIT}"
+  echo "rwkv_mem_state_update_mode=${RWKV_MEM_STATE_UPDATE_MODE}"
   echo "rwkv_mem_separate_delta_projections=${RWKV_MEM_SEPARATE_DELTA_PROJECTIONS}"
 } | tee "${LOG_ROOT}/${RUN_ID}.manifest"
 
@@ -116,8 +126,13 @@ export TOKENIZERS_PARALLELISM=false
   run_name="${RUN_ID}" \
   loss_history_path="${LOSS_HISTORY}" \
   log_interval="${LOG_INTERVAL}" \
+  arch.H_override.rwkv_mem_mode="${RWKV_MEM_MODE}" \
   arch.H_override.rwkv_mem_backend=cuda \
   arch.H_override.rwkv_mem_delta_heads="${RWKV_MEM_DELTA_HEADS}" \
+  arch.H_override.rwkv_mem_rank="${RWKV_MEM_RANK}" \
+  arch.H_override.rwkv_mem_alpha="${RWKV_MEM_ALPHA}" \
+  arch.H_override.rwkv_mem_beta_bias_init="${RWKV_MEM_BETA_BIAS_INIT}" \
+  arch.H_override.rwkv_mem_state_update_mode="${RWKV_MEM_STATE_UPDATE_MODE}" \
   arch.H_override.rwkv_mem_separate_delta_projections="${RWKV_MEM_SEPARATE_DELTA_PROJECTIONS}" \
   2>&1 | tee "${TRAIN_LOG}"
 

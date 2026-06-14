@@ -155,6 +155,7 @@ class Attention(nn.Module):
         init_std_in=None,
         init_std_out=None,
         rwkv_mem_enabled: bool = False,
+        rwkv_mem_mode: str = "delta_rule",
         rwkv_mem_head_size: int = 64,
         rwkv_mem_backend: str = "auto",
         rwkv_mem_chunk_len: int = 16,
@@ -163,6 +164,13 @@ class Attention(nn.Module):
         rwkv_mem_output_init_scale: float = 0.02,
         rwkv_mem_delta_heads: Sequence[str] = ("o",),
         rwkv_mem_separate_delta_projections: bool = False,
+        rwkv_mem_rank: int = 8,
+        rwkv_mem_alpha: float = 16.0,
+        rwkv_mem_beta_bias_init: float = -1.5,
+        rwkv_mem_normalize_qk: bool = True,
+        rwkv_mem_couple_lambda: bool = True,
+        rwkv_mem_state_update_mode: str = "standard",
+        rwkv_mem_rankwise_gates: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -170,11 +178,14 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
         self.attn_type = attn_type
+        self.rwkv_mem_mode = rwkv_mem_mode
         self.rwkv_mem_delta_heads = tuple(rwkv_mem_delta_heads)
         self.rwkv_mem_separate_delta_projections = rwkv_mem_separate_delta_projections
-        unknown_delta_heads = set(self.rwkv_mem_delta_heads) - {"q", "o"}
+        unknown_delta_heads = set(self.rwkv_mem_delta_heads) - {"q", "k", "v", "o"}
         if unknown_delta_heads:
             raise ValueError(f"Unknown RWKV memory delta heads: {sorted(unknown_delta_heads)}")
+        if rwkv_mem_mode not in {"delta_rule", "rwkv7_legacy"}:
+            raise ValueError("rwkv_mem_mode must be 'delta_rule' or 'rwkv7_legacy'")
 
         self.gqkv_proj = LinearInit(hidden_size, self.head_dim, batch_out_features=(2 * self.num_heads + 2 * self.num_key_value_heads, ),
                                    bias=False, init_std=init_std_in, **kwargs)
@@ -184,22 +195,41 @@ class Attention(nn.Module):
         self.rwkv_mem_q_proj = None
         self.rwkv_mem_o_proj = None
         if rwkv_mem_enabled:
-            from models.rwkv_memory import RWKVStateMemory
+            from models.rwkv_memory import DeltaRuleStateMemory, RWKVStateMemory
 
             cpu_rng_state = torch.random.get_rng_state()
             cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() and torch.cuda.is_initialized() else None
             try:
-                self.rwkv_mem = RWKVStateMemory(
-                    max_seq_len=max_seq_len,
-                    hidden_size=hidden_size,
-                    head_size=rwkv_mem_head_size,
-                    backend=rwkv_mem_backend,
-                    chunk_len=rwkv_mem_chunk_len,
-                    scale=rwkv_mem_scale,
-                    output_init=rwkv_mem_output_init,
-                    output_init_scale=rwkv_mem_output_init_scale,
-                )
-                if rwkv_mem_separate_delta_projections:
+                if rwkv_mem_mode == "delta_rule":
+                    self.rwkv_mem = DeltaRuleStateMemory(
+                        hidden_size=hidden_size,
+                        query_size=head_dim * num_heads,
+                        key_size=head_dim * num_key_value_heads,
+                        value_size=head_dim * num_key_value_heads,
+                        output_size=hidden_size,
+                        rank=rwkv_mem_rank,
+                        alpha=rwkv_mem_alpha,
+                        beta_bias_init=rwkv_mem_beta_bias_init,
+                        normalize_qk=rwkv_mem_normalize_qk,
+                        couple_lambda=rwkv_mem_couple_lambda,
+                        state_update_mode=rwkv_mem_state_update_mode,
+                        rankwise_gates=rwkv_mem_rankwise_gates,
+                        delta_heads=rwkv_mem_delta_heads,
+                        output_init=rwkv_mem_output_init,
+                        output_init_scale=rwkv_mem_output_init_scale,
+                    )
+                else:
+                    self.rwkv_mem = RWKVStateMemory(
+                        max_seq_len=max_seq_len,
+                        hidden_size=hidden_size,
+                        head_size=rwkv_mem_head_size,
+                        backend=rwkv_mem_backend,
+                        chunk_len=rwkv_mem_chunk_len,
+                        scale=rwkv_mem_scale,
+                        output_init=rwkv_mem_output_init,
+                        output_init_scale=rwkv_mem_output_init_scale,
+                    )
+                if rwkv_mem_mode == "rwkv7_legacy" and rwkv_mem_separate_delta_projections:
                     if "q" in self.rwkv_mem_delta_heads:
                         self.rwkv_mem_q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
                         nn.init.eye_(self.rwkv_mem_q_proj.weight)
@@ -225,11 +255,21 @@ class Attention(nn.Module):
         gate, query, key, value = gqkv.split((self.num_heads, self.num_heads, self.num_key_value_heads, self.num_key_value_heads), dim=-2)
 
         rwkv_mem_delta = None
+        rwkv_mem_deltas = None
         if self._should_run_rwkv_mem(hidden_states, cache):
-            rwkv_mem_delta = self.rwkv_mem(hidden_states, **seq_info)  # type: ignore[operator]
-            if "q" in self.rwkv_mem_delta_heads:
-                q_delta = self.rwkv_mem_q_proj(rwkv_mem_delta) if self.rwkv_mem_q_proj is not None else rwkv_mem_delta
-                query = query + rearrange(q_delta, "... (h hd) -> ... h hd", h=self.num_heads)
+            if self.rwkv_mem_mode == "delta_rule":
+                rwkv_mem_deltas = self.rwkv_mem(hidden_states, **seq_info)  # type: ignore[operator]
+                if "q" in rwkv_mem_deltas:
+                    query = query + rearrange(rwkv_mem_deltas["q"], "... (h hd) -> ... h hd", h=self.num_heads)
+                if "k" in rwkv_mem_deltas:
+                    key = key + rearrange(rwkv_mem_deltas["k"], "... (h hd) -> ... h hd", h=self.num_key_value_heads)
+                if "v" in rwkv_mem_deltas:
+                    value = value + rearrange(rwkv_mem_deltas["v"], "... (h hd) -> ... h hd", h=self.num_key_value_heads)
+            else:
+                rwkv_mem_delta = self.rwkv_mem(hidden_states, **seq_info)  # type: ignore[operator]
+                if "q" in self.rwkv_mem_delta_heads:
+                    q_delta = self.rwkv_mem_q_proj(rwkv_mem_delta) if self.rwkv_mem_q_proj is not None else rwkv_mem_delta
+                    query = query + rearrange(q_delta, "... (h hd) -> ... h hd", h=self.num_heads)
 
         # query, key, value: [..., seq_len, num_heads, head_dim]
         # RoPE
@@ -256,7 +296,9 @@ class Attention(nn.Module):
         # attn_output: [..., seq_len, num_heads, head_dim]
         attn_output = rearrange(torch.sigmoid(gate) * attn_output, "... h hd -> ... (h hd)")  # type: ignore
         out = self.o_proj(attn_output)
-        if rwkv_mem_delta is not None and "o" in self.rwkv_mem_delta_heads:
+        if rwkv_mem_deltas is not None and "o" in rwkv_mem_deltas:
+            out = out + rwkv_mem_deltas["o"]
+        elif rwkv_mem_delta is not None and "o" in self.rwkv_mem_delta_heads:
             o_delta = self.rwkv_mem_o_proj(rwkv_mem_delta) if self.rwkv_mem_o_proj is not None else rwkv_mem_delta
             out = out + o_delta
         return out
