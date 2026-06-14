@@ -19,6 +19,13 @@ H_override:
   rwkv_mem_base_slice_ref_width: 8
   rwkv_mem_online_gain: 0.05
   rwkv_mem_memory_write_granularity: token
+  rwkv_mem_stateful: false
+  rwkv_mem_trainable_delta_scale: false
+  rwkv_mem_delta_scale_init: 1.0
+  rwkv_mem_delta_scale_max: 2.0
+  rwkv_mem_delta_scale_granularity: layer
+  rwkv_mem_delta_o_rmsnorm: false
+  rwkv_mem_delta_o_rmsnorm_eps: 1e-6
   rwkv_mem_head_size: 64
   rwkv_mem_backend: auto
   rwkv_mem_chunk_len: 16

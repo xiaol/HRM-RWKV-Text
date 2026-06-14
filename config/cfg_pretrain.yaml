@@ -41,3 +41,7 @@ save_checkpoints: true
 log_interval: 5
 loss_history_path: null
 trainable_param_substrings: null
+rwkv_mem_loss_mode: ce
+rwkv_mem_kl_weight: 0.0
+rwkv_mem_kl_temperature: 2.0
+rwkv_mem_reset_each_forward: true

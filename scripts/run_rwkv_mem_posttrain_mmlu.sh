@@ -82,6 +82,17 @@ RWKV_MEM_OUTPUT_INIT="${RWKV_MEM_OUTPUT_INIT:-zero}"
 RWKV_MEM_BASE_SLICE_REF_WIDTH="${RWKV_MEM_BASE_SLICE_REF_WIDTH:-8}"
 RWKV_MEM_ONLINE_GAIN="${RWKV_MEM_ONLINE_GAIN:-0.05}"
 RWKV_MEM_MEMORY_WRITE_GRANULARITY="${RWKV_MEM_MEMORY_WRITE_GRANULARITY:-token}"
+RWKV_MEM_STATEFUL="${RWKV_MEM_STATEFUL:-false}"
+RWKV_MEM_TRAINABLE_DELTA_SCALE="${RWKV_MEM_TRAINABLE_DELTA_SCALE:-false}"
+RWKV_MEM_DELTA_SCALE_INIT="${RWKV_MEM_DELTA_SCALE_INIT:-1.0}"
+RWKV_MEM_DELTA_SCALE_MAX="${RWKV_MEM_DELTA_SCALE_MAX:-2.0}"
+RWKV_MEM_DELTA_SCALE_GRANULARITY="${RWKV_MEM_DELTA_SCALE_GRANULARITY:-layer}"
+RWKV_MEM_DELTA_O_RMSNORM="${RWKV_MEM_DELTA_O_RMSNORM:-false}"
+RWKV_MEM_DELTA_O_RMSNORM_EPS="${RWKV_MEM_DELTA_O_RMSNORM_EPS:-1e-6}"
+RWKV_MEM_LOSS_MODE="${RWKV_MEM_LOSS_MODE:-ce}"
+RWKV_MEM_KL_WEIGHT="${RWKV_MEM_KL_WEIGHT:-0.0}"
+RWKV_MEM_KL_TEMPERATURE="${RWKV_MEM_KL_TEMPERATURE:-2.0}"
+RWKV_MEM_RESET_EACH_FORWARD="${RWKV_MEM_RESET_EACH_FORWARD:-true}"
 
 mkdir -p "${CKPT_DIR}" "${LOG_ROOT}"
 
@@ -116,6 +127,17 @@ fi
   echo "rwkv_mem_base_slice_ref_width=${RWKV_MEM_BASE_SLICE_REF_WIDTH}"
   echo "rwkv_mem_online_gain=${RWKV_MEM_ONLINE_GAIN}"
   echo "rwkv_mem_memory_write_granularity=${RWKV_MEM_MEMORY_WRITE_GRANULARITY}"
+  echo "rwkv_mem_stateful=${RWKV_MEM_STATEFUL}"
+  echo "rwkv_mem_trainable_delta_scale=${RWKV_MEM_TRAINABLE_DELTA_SCALE}"
+  echo "rwkv_mem_delta_scale_init=${RWKV_MEM_DELTA_SCALE_INIT}"
+  echo "rwkv_mem_delta_scale_max=${RWKV_MEM_DELTA_SCALE_MAX}"
+  echo "rwkv_mem_delta_scale_granularity=${RWKV_MEM_DELTA_SCALE_GRANULARITY}"
+  echo "rwkv_mem_delta_o_rmsnorm=${RWKV_MEM_DELTA_O_RMSNORM}"
+  echo "rwkv_mem_delta_o_rmsnorm_eps=${RWKV_MEM_DELTA_O_RMSNORM_EPS}"
+  echo "rwkv_mem_loss_mode=${RWKV_MEM_LOSS_MODE}"
+  echo "rwkv_mem_kl_weight=${RWKV_MEM_KL_WEIGHT}"
+  echo "rwkv_mem_kl_temperature=${RWKV_MEM_KL_TEMPERATURE}"
+  echo "rwkv_mem_reset_each_forward=${RWKV_MEM_RESET_EACH_FORWARD}"
   echo "delta_mem_repo=${DELTA_MEM_REPO}"
 } | tee "${LOG_ROOT}/${RUN_ID}.manifest"
 
@@ -141,6 +163,10 @@ fi
   run_name="${RUN_ID}" \
   loss_history_path="${LOSS_HISTORY}" \
   log_interval="${LOG_INTERVAL}" \
+  rwkv_mem_loss_mode="${RWKV_MEM_LOSS_MODE}" \
+  rwkv_mem_kl_weight="${RWKV_MEM_KL_WEIGHT}" \
+  rwkv_mem_kl_temperature="${RWKV_MEM_KL_TEMPERATURE}" \
+  rwkv_mem_reset_each_forward="${RWKV_MEM_RESET_EACH_FORWARD}" \
   arch.H_override.rwkv_mem_mode="${RWKV_MEM_MODE}" \
   arch.H_override.rwkv_mem_backend=cuda \
   arch.H_override.rwkv_mem_output_init="${RWKV_MEM_OUTPUT_INIT}" \
@@ -154,6 +180,13 @@ fi
   arch.H_override.rwkv_mem_base_slice_ref_width="${RWKV_MEM_BASE_SLICE_REF_WIDTH}" \
   arch.H_override.rwkv_mem_online_gain="${RWKV_MEM_ONLINE_GAIN}" \
   arch.H_override.rwkv_mem_memory_write_granularity="${RWKV_MEM_MEMORY_WRITE_GRANULARITY}" \
+  arch.H_override.rwkv_mem_stateful="${RWKV_MEM_STATEFUL}" \
+  arch.H_override.rwkv_mem_trainable_delta_scale="${RWKV_MEM_TRAINABLE_DELTA_SCALE}" \
+  arch.H_override.rwkv_mem_delta_scale_init="${RWKV_MEM_DELTA_SCALE_INIT}" \
+  arch.H_override.rwkv_mem_delta_scale_max="${RWKV_MEM_DELTA_SCALE_MAX}" \
+  arch.H_override.rwkv_mem_delta_scale_granularity="${RWKV_MEM_DELTA_SCALE_GRANULARITY}" \
+  arch.H_override.rwkv_mem_delta_o_rmsnorm="${RWKV_MEM_DELTA_O_RMSNORM}" \
+  arch.H_override.rwkv_mem_delta_o_rmsnorm_eps="${RWKV_MEM_DELTA_O_RMSNORM_EPS}" \
   2>&1 | tee "${TRAIN_LOG}"
 
 if [[ "${RUN_MMLU}" == "1" ]]; then

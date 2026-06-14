@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Optional, Sequence
 
 import torch
@@ -20,6 +21,7 @@ VALID_DELTA_MEM_HEADS = ("q", "k", "v", "o")
 VALID_DELTA_MEM_STATE_UPDATE_MODES = ("standard", "lambda_outside", "no_lambda")
 VALID_DELTA_MEM_OUTPUT_INITS = ("zero", "small", "random", "base_slice", "base_slice_fixed")
 VALID_DELTA_MEM_WRITE_GRANULARITIES = ("token", "message_mean", "sentence_mean")
+VALID_DELTA_MEM_SCALE_GRANULARITIES = ("layer", "head")
 
 
 def normalize_delta_mem_heads(heads: Sequence[str] | str) -> tuple[str, ...]:
@@ -165,6 +167,13 @@ class DeltaRuleStateMemory(nn.Module):
         online_gain: float = 0.05,
         memory_write_granularity: str = "token",
         backend: str = "auto",
+        stateful: bool = False,
+        trainable_delta_scale: bool = False,
+        delta_scale_init: float = 1.0,
+        delta_scale_max: float = 2.0,
+        delta_scale_granularity: str = "layer",
+        delta_o_rmsnorm: bool = False,
+        delta_o_rmsnorm_eps: float = 1e-6,
         base_q_weight: Optional[Tensor] = None,
         base_k_weight: Optional[Tensor] = None,
         base_v_weight: Optional[Tensor] = None,
@@ -191,6 +200,15 @@ class DeltaRuleStateMemory(nn.Module):
                 f"Unsupported memory_write_granularity={memory_write_granularity!r}; "
                 f"expected one of {VALID_DELTA_MEM_WRITE_GRANULARITIES}"
             )
+        if delta_scale_granularity not in VALID_DELTA_MEM_SCALE_GRANULARITIES:
+            raise ValueError(
+                f"Unsupported delta_scale_granularity={delta_scale_granularity!r}; "
+                f"expected one of {VALID_DELTA_MEM_SCALE_GRANULARITIES}"
+            )
+        if delta_scale_init <= 0.0 or delta_scale_max <= 0.0 or delta_scale_init >= delta_scale_max:
+            raise ValueError("delta_scale_init and delta_scale_max must satisfy 0 < init < max")
+        if delta_o_rmsnorm_eps <= 0.0:
+            raise ValueError("delta_o_rmsnorm_eps must be > 0")
 
         self.hidden_size = hidden_size
         self.query_size = query_size
@@ -211,6 +229,15 @@ class DeltaRuleStateMemory(nn.Module):
         self.base_slice_ref_width = int(base_slice_ref_width)
         self.online_gain = float(online_gain)
         self.memory_write_granularity = memory_write_granularity
+        self.stateful = bool(stateful)
+        self.write_enabled = True
+        self.delta_state: Optional[Tensor] = None
+        self.read_context_mask: Optional[Tensor] = None
+        self.trainable_delta_scale = bool(trainable_delta_scale)
+        self.delta_scale_max = float(delta_scale_max)
+        self.delta_scale_granularity = delta_scale_granularity
+        self.delta_o_rmsnorm = bool(delta_o_rmsnorm)
+        self.delta_o_rmsnorm_eps = float(delta_o_rmsnorm_eps)
         if backend not in {"auto", "cuda", "torch"}:
             raise ValueError("delta-rule memory backend must be 'auto', 'cuda', or 'torch'")
         self.backend = backend
@@ -233,6 +260,16 @@ class DeltaRuleStateMemory(nn.Module):
         self.delta_k_proj = nn.Linear(self.state_read_dim, key_size, bias=False, **kwargs)
         self.delta_v_proj = nn.Linear(self.state_read_dim, value_size, bias=False, **kwargs)
         self.delta_o_proj = nn.Linear(self.state_read_dim, output_size, bias=False, **kwargs)
+        if self.trainable_delta_scale:
+            scale_shape = (len(VALID_DELTA_MEM_HEADS),) if self.delta_scale_granularity == "head" else (1,)
+            init_raw = self._inverse_bounded_sigmoid(delta_scale_init, self.delta_scale_max)
+            self.delta_scale_raw = nn.Parameter(torch.full(scale_shape, init_raw, **kwargs))
+        else:
+            self.delta_scale_raw = None
+        if self.delta_o_rmsnorm:
+            self.delta_o_rmsnorm_weight = nn.Parameter(torch.ones(output_size, **kwargs))
+        else:
+            self.delta_o_rmsnorm_weight = None
         self.reset_parameters(
             output_init,
             output_init_scale,
@@ -241,6 +278,23 @@ class DeltaRuleStateMemory(nn.Module):
             base_v_weight=base_v_weight,
             base_o_weight=base_o_weight,
         )
+
+    @staticmethod
+    def _inverse_bounded_sigmoid(value: float, max_value: float) -> float:
+        clipped = min(max(value / max_value, 1e-4), 1.0 - 1e-4)
+        return math.log(clipped / (1.0 - clipped))
+
+    def reset_state(self) -> None:
+        self.delta_state = None
+        self.read_context_mask = None
+
+    def set_write_enabled(self, enabled: bool) -> None:
+        if enabled:
+            self.read_context_mask = None
+        self.write_enabled = bool(enabled)
+
+    def set_read_context_mask(self, mask: Optional[Tensor]) -> None:
+        self.read_context_mask = mask
 
     def _init_delta_head(
         self,
@@ -300,6 +354,8 @@ class DeltaRuleStateMemory(nn.Module):
         nn.init.zeros_(self.beta_proj.weight)
         if self.lambda_proj is not None:
             nn.init.zeros_(self.lambda_proj.weight)
+        if self.delta_o_rmsnorm_weight is not None:
+            nn.init.ones_(self.delta_o_rmsnorm_weight)
 
         for name, proj, base_weight in (
             ("q", self.delta_q_proj, base_q_weight),
@@ -360,6 +416,10 @@ class DeltaRuleStateMemory(nn.Module):
             return "v" in self.delta_heads
         if sub_name.startswith("delta_o_proj."):
             return "o" in self.delta_heads
+        if sub_name == "delta_scale_raw":
+            return self.trainable_delta_scale
+        if sub_name == "delta_o_rmsnorm_weight":
+            return self.delta_o_rmsnorm and "o" in self.delta_heads
         return True
 
     def _update_coefficients(self, beta: Tensor, lam: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -381,9 +441,13 @@ class DeltaRuleStateMemory(nn.Module):
         write: Tensor,
         token_mask: Optional[Tensor],
         dtype: torch.dtype,
-    ) -> Tensor:
+        initial_state: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor]:
         batch_size, seq_len, _ = memory_q.shape
-        state = torch.zeros(batch_size, self.rank, self.rank, device=memory_q.device, dtype=torch.float32)
+        if initial_state is None:
+            state = torch.zeros(batch_size, self.rank, self.rank, device=memory_q.device, dtype=torch.float32)
+        else:
+            state = initial_state.float()
         reads: list[Tensor] = []
         q_seq = memory_q.float()
         k_seq = memory_k.float()
@@ -413,7 +477,26 @@ class DeltaRuleStateMemory(nn.Module):
                 state = next_state
             reads.append(read_t.to(dtype=dtype))
 
-        return torch.stack(reads, dim=1)
+        return state, torch.stack(reads, dim=1)
+
+    def _initial_state_for_scan(self, batch_size: int, device: torch.device) -> Tensor:
+        flat_batch = batch_size * self.num_state_heads
+        if self.stateful and self.delta_state is not None:
+            state = self.delta_state
+            if state.shape[0] == batch_size and state.device == device:
+                return state.reshape(flat_batch, self.rank, self.rank).float()
+        return torch.zeros(flat_batch, self.rank, self.rank, device=device, dtype=torch.float32)
+
+    def _store_final_state(self, final_state: Tensor, batch_size: int) -> None:
+        if not self.stateful:
+            return
+        self.delta_state = final_state.reshape(batch_size, self.num_state_heads, self.rank, self.rank).detach()
+
+    def _state_reads_only(self, state: Tensor, q_seq: Tensor, token_mask: Optional[Tensor], dtype: torch.dtype) -> Tensor:
+        reads = torch.einsum("bij,btj->bti", state.float(), q_seq.float())
+        if token_mask is not None:
+            reads = reads * token_mask.unsqueeze(-1).to(dtype=reads.dtype)
+        return reads.to(dtype=dtype)
 
     def _scan_batched(self, x: Tensor, token_mask: Optional[Tensor] = None) -> Tensor:
         memory_q, memory_k, memory_v, beta, lam = self._project_memory(x)
@@ -421,7 +504,7 @@ class DeltaRuleStateMemory(nn.Module):
 
         batch_size, seq_len, _ = x.shape
         flat_batch = batch_size * self.num_state_heads
-        state = torch.zeros(flat_batch, self.rank, self.rank, device=x.device, dtype=torch.float32)
+        state = self._initial_state_for_scan(batch_size, x.device)
         q_seq = memory_q.float().view(batch_size, seq_len, self.num_state_heads, self.rank)
         k_seq = memory_k.float().view(batch_size, seq_len, self.num_state_heads, self.rank)
         v_seq = memory_v.float().view(batch_size, seq_len, self.num_state_heads, self.rank)
@@ -439,10 +522,15 @@ class DeltaRuleStateMemory(nn.Module):
                 .reshape(flat_batch, seq_len)
             )
 
+        if not self.write_enabled:
+            reads_flat = self._state_reads_only(state, q_seq, token_mask_for_scan, x.dtype)
+            reads = reads_flat.reshape(batch_size, self.num_state_heads, seq_len, self.rank)
+            return reads.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.state_read_dim)
+
         if self.backend in {"auto", "cuda"} and triton_affine_scan is not None and triton_scan_support is not None:
             support = triton_scan_support(state, q_seq, k_seq, v_seq, keep_seq, erase_seq, write_seq)
             if support.supported:
-                _state_out, reads_flat = triton_affine_scan(
+                state_out, reads_flat = triton_affine_scan(
                     state,
                     q_seq,
                     k_seq,
@@ -452,10 +540,11 @@ class DeltaRuleStateMemory(nn.Module):
                     write_seq,
                     token_mask_for_scan,
                 )
+                self._store_final_state(state_out, batch_size)
                 reads = reads_flat.reshape(batch_size, self.num_state_heads, seq_len, self.rank)
                 return reads.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.state_read_dim).to(dtype=x.dtype)
 
-        reads_flat = self._scan_batched_torch(
+        state_out, reads_flat = self._scan_batched_torch(
             memory_q=q_seq,
             memory_k=k_seq,
             memory_v=v_seq,
@@ -464,14 +553,39 @@ class DeltaRuleStateMemory(nn.Module):
             write=write_seq,
             token_mask=token_mask_for_scan,
             dtype=x.dtype,
+            initial_state=state,
         )
+        self._store_final_state(state_out, batch_size)
         reads = reads_flat.reshape(batch_size, self.num_state_heads, seq_len, self.rank)
         return reads.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.state_read_dim)
+
+    def _delta_scale_multiplier(self, head: str, dtype: torch.dtype, device: torch.device) -> Tensor:
+        if self.delta_scale_raw is None:
+            return torch.ones((), dtype=dtype, device=device)
+        if self.delta_scale_granularity == "head":
+            raw = self.delta_scale_raw[VALID_DELTA_MEM_HEADS.index(head)]
+        else:
+            raw = self.delta_scale_raw[0]
+        return (torch.sigmoid(raw) * self.delta_scale_max).to(device=device, dtype=dtype)
+
+    def _apply_delta_o_rmsnorm(self, delta: Tensor) -> Tensor:
+        if self.delta_o_rmsnorm_weight is None:
+            return delta
+        normalized = F.rms_norm(
+            delta.float(),
+            (delta.shape[-1],),
+            weight=self.delta_o_rmsnorm_weight.float(),
+            eps=self.delta_o_rmsnorm_eps,
+        )
+        return normalized.to(dtype=delta.dtype)
 
     def _project_delta(self, reads: Tensor, head: str, proj: nn.Linear) -> Optional[Tensor]:
         if head not in self.delta_heads:
             return None
-        return proj(reads) * self.delta_scaling
+        delta = proj(reads) * self.delta_scaling * self._delta_scale_multiplier(head, reads.dtype, reads.device)
+        if head == "o":
+            delta = self._apply_delta_o_rmsnorm(delta)
+        return delta
 
     def _deltas_from_reads(self, reads: Tensor) -> dict[str, Tensor]:
         deltas = {
@@ -483,6 +597,8 @@ class DeltaRuleStateMemory(nn.Module):
         return {name: delta for name, delta in deltas.items() if delta is not None}
 
     def _forward_batched(self, x: Tensor, token_mask: Optional[Tensor] = None) -> dict[str, Tensor]:
+        if self.read_context_mask is not None and self.read_context_mask.shape[:2] == x.shape[:2]:
+            token_mask = self.read_context_mask.to(device=x.device, dtype=torch.bool)
         reads = self._scan_batched(x, token_mask=token_mask)
         return self._deltas_from_reads(reads)
 
@@ -510,7 +626,12 @@ class DeltaRuleStateMemory(nn.Module):
 
         padded = x.new_zeros((n, max_len, x.shape[-1]))
         padded[mask] = x[src[mask]]
-        padded_deltas = self._forward_batched(padded, token_mask=mask)
+        read_mask = mask
+        if self.read_context_mask is not None and self.read_context_mask.numel() == x.shape[0]:
+            flat_read_mask = self.read_context_mask.to(device=x.device, dtype=torch.bool)
+            read_mask = torch.zeros_like(mask)
+            read_mask[mask] = flat_read_mask[src[mask]]
+        padded_deltas = self._forward_batched(padded, token_mask=read_mask)
 
         out: dict[str, Tensor] = {}
         for name, padded_delta in padded_deltas.items():
@@ -542,3 +663,30 @@ class DeltaRuleStateMemory(nn.Module):
         cu_seqlens = unwrap_tensor(cu_seqlens)
         numseqs = unwrap_tensor(numseqs)
         return self._forward_packed(x, cu_seqlens, numseqs)
+
+
+def iter_rwkv_mem_modules(module: nn.Module):
+    for name, child in module.named_modules():
+        if isinstance(child, DeltaRuleStateMemory):
+            yield name, child
+
+
+def reset_rwkv_mem_states(module: nn.Module) -> None:
+    for _name, child in iter_rwkv_mem_modules(module):
+        child.reset_state()
+
+
+def set_rwkv_mem_write_enabled(module: nn.Module, enabled: bool) -> None:
+    for _name, child in iter_rwkv_mem_modules(module):
+        child.set_write_enabled(enabled)
+
+
+def set_rwkv_mem_read_context_mask(module: nn.Module, mask: Optional[Tensor]) -> None:
+    for _name, child in iter_rwkv_mem_modules(module):
+        child.set_read_context_mask(mask)
+
+
+def set_rwkv_mem_runtime_enabled(module: nn.Module, enabled: bool) -> None:
+    for child in module.modules():
+        if hasattr(child, "rwkv_mem_runtime_enabled"):
+            child.rwkv_mem_runtime_enabled = bool(enabled)

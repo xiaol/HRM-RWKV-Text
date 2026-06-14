@@ -88,6 +88,10 @@ class PretrainConfig(pydantic.BaseModel):
     log_interval: int = 5
     loss_history_path: Optional[str] = None
     trainable_param_substrings: Optional[list[str]] = None
+    rwkv_mem_loss_mode: str = "ce"
+    rwkv_mem_kl_weight: float = 0.0
+    rwkv_mem_kl_temperature: float = 2.0
+    rwkv_mem_reset_each_forward: bool = True
 
 
 @dataclass
@@ -607,7 +611,17 @@ def launch(hydra_config: DictConfig):
             metrics_accum: Optional[dict[str, tuple[Tensor, Tensor]]] = None
             for batch, batch_info in zip(microbatches, microbatch_infos):
                 batch = move_batch_to_device(batch, device)
-                metrics = train_microbatch_fn(train_state, batch | batch_info, loss_divisor=loss_divisor, autocast_dtype=autocast_dtype, **train_extra_args)
+                metrics = train_microbatch_fn(
+                    train_state,
+                    batch | batch_info,
+                    loss_divisor=loss_divisor,
+                    autocast_dtype=autocast_dtype,
+                    rwkv_mem_loss_mode=config.rwkv_mem_loss_mode,
+                    rwkv_mem_kl_weight=config.rwkv_mem_kl_weight,
+                    rwkv_mem_kl_temperature=config.rwkv_mem_kl_temperature,
+                    rwkv_mem_reset_each_forward=config.rwkv_mem_reset_each_forward,
+                    **train_extra_args,
+                )
                 if metrics_accum is None:
                     metrics_accum = {k: (v[0].detach(), v[1].detach()) for k, v in metrics.items()}
                 else:

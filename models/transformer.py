@@ -59,6 +59,13 @@ class TransformerConfig(BaseModel):
     rwkv_mem_base_slice_ref_width: int = 8
     rwkv_mem_online_gain: float = 0.05
     rwkv_mem_memory_write_granularity: Literal["token", "message_mean", "sentence_mean"] = "token"
+    rwkv_mem_stateful: bool = False
+    rwkv_mem_trainable_delta_scale: bool = False
+    rwkv_mem_delta_scale_init: float = 1.0
+    rwkv_mem_delta_scale_max: float = 2.0
+    rwkv_mem_delta_scale_granularity: Literal["layer", "head"] = "layer"
+    rwkv_mem_delta_o_rmsnorm: bool = False
+    rwkv_mem_delta_o_rmsnorm_eps: float = 1e-6
 
     # [Computed properties]
     @property
@@ -118,6 +125,13 @@ class TransformerBlock(nn.Module):
             rwkv_mem_base_slice_ref_width=config.rwkv_mem_base_slice_ref_width,
             rwkv_mem_online_gain=config.rwkv_mem_online_gain,
             rwkv_mem_memory_write_granularity=config.rwkv_mem_memory_write_granularity,
+            rwkv_mem_stateful=config.rwkv_mem_stateful,
+            rwkv_mem_trainable_delta_scale=config.rwkv_mem_trainable_delta_scale,
+            rwkv_mem_delta_scale_init=config.rwkv_mem_delta_scale_init,
+            rwkv_mem_delta_scale_max=config.rwkv_mem_delta_scale_max,
+            rwkv_mem_delta_scale_granularity=config.rwkv_mem_delta_scale_granularity,
+            rwkv_mem_delta_o_rmsnorm=config.rwkv_mem_delta_o_rmsnorm,
+            rwkv_mem_delta_o_rmsnorm_eps=config.rwkv_mem_delta_o_rmsnorm_eps,
         )
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,

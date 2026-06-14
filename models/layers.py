@@ -175,6 +175,13 @@ class Attention(nn.Module):
         rwkv_mem_base_slice_ref_width: int = 8,
         rwkv_mem_online_gain: float = 0.05,
         rwkv_mem_memory_write_granularity: str = "token",
+        rwkv_mem_stateful: bool = False,
+        rwkv_mem_trainable_delta_scale: bool = False,
+        rwkv_mem_delta_scale_init: float = 1.0,
+        rwkv_mem_delta_scale_max: float = 2.0,
+        rwkv_mem_delta_scale_granularity: str = "layer",
+        rwkv_mem_delta_o_rmsnorm: bool = False,
+        rwkv_mem_delta_o_rmsnorm_eps: float = 1e-6,
         **kwargs,
     ):
         super().__init__()
@@ -185,6 +192,7 @@ class Attention(nn.Module):
         self.rwkv_mem_mode = rwkv_mem_mode
         self.rwkv_mem_delta_heads = tuple(rwkv_mem_delta_heads)
         self.rwkv_mem_separate_delta_projections = rwkv_mem_separate_delta_projections
+        self.rwkv_mem_runtime_enabled = True
         unknown_delta_heads = set(self.rwkv_mem_delta_heads) - {"q", "k", "v", "o"}
         if unknown_delta_heads:
             raise ValueError(f"Unknown RWKV memory delta heads: {sorted(unknown_delta_heads)}")
@@ -228,6 +236,13 @@ class Attention(nn.Module):
                         online_gain=rwkv_mem_online_gain,
                         memory_write_granularity=rwkv_mem_memory_write_granularity,
                         backend=rwkv_mem_backend,
+                        stateful=rwkv_mem_stateful,
+                        trainable_delta_scale=rwkv_mem_trainable_delta_scale,
+                        delta_scale_init=rwkv_mem_delta_scale_init,
+                        delta_scale_max=rwkv_mem_delta_scale_max,
+                        delta_scale_granularity=rwkv_mem_delta_scale_granularity,
+                        delta_o_rmsnorm=rwkv_mem_delta_o_rmsnorm,
+                        delta_o_rmsnorm_eps=rwkv_mem_delta_o_rmsnorm_eps,
                         base_q_weight=self.gqkv_proj.weight[self.num_heads * head_dim : 2 * self.num_heads * head_dim],
                         base_k_weight=self.gqkv_proj.weight[
                             2 * self.num_heads * head_dim : (2 * self.num_heads + self.num_key_value_heads) * head_dim
@@ -284,7 +299,7 @@ class Attention(nn.Module):
     def _should_run_rwkv_mem(self, hidden_states: Tensor, cache: Optional[Cache]) -> bool:
         # Cached generation prefill passes the full prompt with cache allocated.
         # Single-token decode still needs persistent RWKV state, so skip it.
-        return self.rwkv_mem is not None and (cache is None or hidden_states.shape[-2] > 1)
+        return self.rwkv_mem_runtime_enabled and self.rwkv_mem is not None and (cache is None or hidden_states.shape[-2] > 1)
 
     def forward(self, hidden_states: Tensor, cos_sin: Optional[CosSin], cache: Optional[Cache] = None, cache_lengths: Optional[Tensor] = None, **seq_info) -> Tensor:
         # hidden_states, gqkv: [..., seq_len, hidden_size]
