@@ -63,7 +63,7 @@ rwkv_mem_alpha: 16.0
 rwkv_mem_beta_bias_init: -1.5
 rwkv_mem_state_update_mode: standard
 rwkv_mem_output_init: zero
-rwkv_mem_delta_heads: [q, o]
+rwkv_mem_delta_heads: [q, k, v, o]
 rwkv_mem_separate_delta_projections: false
 rwkv_mem_backend: cuda
 global_batch_size: 196608
@@ -75,7 +75,7 @@ ema: null
 compile_train: false
 ```
 
-Why adapter-only first: zero-init makes the starting model identical to the original checkpoint, and adapter-only updates limit MMLU regression risk. The default active heads remain `q,o` because the released delta-Mem adapter also uses Q/O, but the implementation now has the full memory-side recipe: learned memory q/k/v, delta-rule online state update, and optional q/k/v/o attention deltas. With zero delta heads, memory q/k/v gradients begin after the delta heads move off zero; use `rwkv_mem_output_init: small` only for experiments that do not require exact step-0 teacher equivalence. If MMLU improves or stays close while validation CE improves, Stage B can unfreeze more H-level parameters at a lower LR.
+Why adapter-only first: zero-init makes the starting model identical to the original checkpoint, and adapter-only updates limit MMLU regression risk. The full active head set is `q,k,v,o`; use `q,o` as a separate release-compatible delta-Mem comparison because the public Qwen adapter is described as Q/O. The implementation has the full memory-side recipe: learned memory q/k/v, delta-rule online state update, and q/k/v/o attention deltas. With zero delta heads, memory q/k/v gradients begin after the delta heads move off zero; use `rwkv_mem_output_init: small` only for experiments that do not require exact step-0 teacher equivalence. If MMLU improves or stays close while validation CE improves, Stage B can unfreeze more H-level parameters at a lower LR.
 
 ## Launch
 
@@ -92,6 +92,14 @@ DATA_PATH=/run/media/xiaol/B214449214445C0B/hrm_text_10b_v1 \
 MAX_STEPS=200 \
 bash scripts/run_rwkv_mem_posttrain_mmlu.sh
 ```
+
+Comparison launch:
+
+```bash
+bash scripts/run_rwkv_qkv_vs_delta_mem_200.sh
+```
+
+This runs full delta-Mem `[q,k,v,o]`, release-compatible delta-Mem `[q,o]`, and RWKV-state memory `[q,k,v]`. The RWKV-state path is not parameter-matched yet; it trains the RWKV reader plus projection heads and is much larger than the delta-rule adapter.
 
 Smoke without MMLU:
 

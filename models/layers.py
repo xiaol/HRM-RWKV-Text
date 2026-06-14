@@ -184,8 +184,8 @@ class Attention(nn.Module):
         unknown_delta_heads = set(self.rwkv_mem_delta_heads) - {"q", "k", "v", "o"}
         if unknown_delta_heads:
             raise ValueError(f"Unknown RWKV memory delta heads: {sorted(unknown_delta_heads)}")
-        if rwkv_mem_mode not in {"delta_rule", "rwkv7_legacy"}:
-            raise ValueError("rwkv_mem_mode must be 'delta_rule' or 'rwkv7_legacy'")
+        if rwkv_mem_mode not in {"delta_rule", "rwkv7", "rwkv7_legacy"}:
+            raise ValueError("rwkv_mem_mode must be 'delta_rule', 'rwkv7', or 'rwkv7_legacy'")
 
         self.gqkv_proj = LinearInit(hidden_size, self.head_dim, batch_out_features=(2 * self.num_heads + 2 * self.num_key_value_heads, ),
                                    bias=False, init_std=init_std_in, **kwargs)
@@ -193,6 +193,8 @@ class Attention(nn.Module):
                                  bias=False, init_std=init_std_out, **kwargs)
         self.rwkv_mem = None
         self.rwkv_mem_q_proj = None
+        self.rwkv_mem_k_proj = None
+        self.rwkv_mem_v_proj = None
         self.rwkv_mem_o_proj = None
         if rwkv_mem_enabled:
             from models.rwkv_memory import DeltaRuleStateMemory, RWKVStateMemory
@@ -217,6 +219,8 @@ class Attention(nn.Module):
                         delta_heads=rwkv_mem_delta_heads,
                         output_init=rwkv_mem_output_init,
                         output_init_scale=rwkv_mem_output_init_scale,
+                        backend=rwkv_mem_backend,
+                        **kwargs,
                     )
                 else:
                     self.rwkv_mem = RWKVStateMemory(
@@ -228,18 +232,37 @@ class Attention(nn.Module):
                         scale=rwkv_mem_scale,
                         output_init=rwkv_mem_output_init,
                         output_init_scale=rwkv_mem_output_init_scale,
+                        **kwargs,
                     )
-                if rwkv_mem_mode == "rwkv7_legacy" and rwkv_mem_separate_delta_projections:
-                    if "q" in self.rwkv_mem_delta_heads:
-                        self.rwkv_mem_q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-                        nn.init.eye_(self.rwkv_mem_q_proj.weight)
-                    if "o" in self.rwkv_mem_delta_heads:
-                        self.rwkv_mem_o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-                        nn.init.eye_(self.rwkv_mem_o_proj.weight)
+                    force_projections = rwkv_mem_mode == "rwkv7"
+                    if force_projections or rwkv_mem_separate_delta_projections:
+                        if "q" in self.rwkv_mem_delta_heads:
+                            self.rwkv_mem_q_proj = nn.Linear(hidden_size, head_dim * num_heads, bias=False, **kwargs)
+                            self._init_rwkv_mem_projection(self.rwkv_mem_q_proj)
+                        if "k" in self.rwkv_mem_delta_heads:
+                            self.rwkv_mem_k_proj = nn.Linear(hidden_size, head_dim * num_key_value_heads, bias=False, **kwargs)
+                            self._init_rwkv_mem_projection(self.rwkv_mem_k_proj)
+                        if "v" in self.rwkv_mem_delta_heads:
+                            self.rwkv_mem_v_proj = nn.Linear(hidden_size, head_dim * num_key_value_heads, bias=False, **kwargs)
+                            self._init_rwkv_mem_projection(self.rwkv_mem_v_proj)
+                        if "o" in self.rwkv_mem_delta_heads:
+                            self.rwkv_mem_o_proj = nn.Linear(hidden_size, hidden_size, bias=False, **kwargs)
+                            self._init_rwkv_mem_projection(self.rwkv_mem_o_proj)
             finally:
                 torch.random.set_rng_state(cpu_rng_state)
                 if cuda_rng_states is not None:
                     torch.cuda.set_rng_state_all(cuda_rng_states)
+
+    @staticmethod
+    def _init_rwkv_mem_projection(proj: nn.Linear) -> None:
+        nn.init.zeros_(proj.weight)
+        diag = min(proj.weight.shape)
+        with torch.no_grad():
+            proj.weight[:diag, :diag].copy_(torch.eye(diag, device=proj.weight.device, dtype=proj.weight.dtype))
+
+    @staticmethod
+    def _project_rwkv_mem_delta(delta: Tensor, proj: Optional[nn.Linear]) -> Tensor:
+        return proj(delta) if proj is not None else delta
 
     def _should_run_rwkv_mem(self, hidden_states: Tensor, cache: Optional[Cache]) -> bool:
         # Cached generation prefill passes the full prompt with cache allocated.
@@ -268,8 +291,14 @@ class Attention(nn.Module):
             else:
                 rwkv_mem_delta = self.rwkv_mem(hidden_states, **seq_info)  # type: ignore[operator]
                 if "q" in self.rwkv_mem_delta_heads:
-                    q_delta = self.rwkv_mem_q_proj(rwkv_mem_delta) if self.rwkv_mem_q_proj is not None else rwkv_mem_delta
+                    q_delta = self._project_rwkv_mem_delta(rwkv_mem_delta, self.rwkv_mem_q_proj)
                     query = query + rearrange(q_delta, "... (h hd) -> ... h hd", h=self.num_heads)
+                if "k" in self.rwkv_mem_delta_heads:
+                    k_delta = self._project_rwkv_mem_delta(rwkv_mem_delta, self.rwkv_mem_k_proj)
+                    key = key + rearrange(k_delta, "... (h hd) -> ... h hd", h=self.num_key_value_heads)
+                if "v" in self.rwkv_mem_delta_heads:
+                    v_delta = self._project_rwkv_mem_delta(rwkv_mem_delta, self.rwkv_mem_v_proj)
+                    value = value + rearrange(v_delta, "... (h hd) -> ... h hd", h=self.num_key_value_heads)
 
         # query, key, value: [..., seq_len, num_heads, head_dim]
         # RoPE
@@ -299,7 +328,7 @@ class Attention(nn.Module):
         if rwkv_mem_deltas is not None and "o" in rwkv_mem_deltas:
             out = out + rwkv_mem_deltas["o"]
         elif rwkv_mem_delta is not None and "o" in self.rwkv_mem_delta_heads:
-            o_delta = self.rwkv_mem_o_proj(rwkv_mem_delta) if self.rwkv_mem_o_proj is not None else rwkv_mem_delta
+            o_delta = self._project_rwkv_mem_delta(rwkv_mem_delta, self.rwkv_mem_o_proj)
             out = out + o_delta
         return out
 

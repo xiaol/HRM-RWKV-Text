@@ -4,11 +4,12 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)}"
 DISK="${DISK:-/run/media/xiaol/B214449214445C0B}"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
+DELTA_MEM_REPO="${DELTA_MEM_REPO:-/home/xiaol/X/delta-Mem}"
 
 DATA_PATH="${DATA_PATH:-${DISK}/hrm_text_full_v1}"
 TEACHER_SAFETENSORS="${TEACHER_SAFETENSORS:-${DISK}/hrm_text_eval_checkpoints/hrm_text_1b_teacher/model.safetensors}"
 BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-}"
-RUN_ID="${RUN_ID:-delta_mem_qo_spare_600m}"
+RUN_ID="${RUN_ID:-delta_mem_qkvo_spare_600m}"
 CKPT_DIR="${CKPT_DIR:-${DISK}/hrm_text_pretrain_checkpoints/rwkv_mem_posttrain/${RUN_ID}}"
 LOG_DIR="${LOG_DIR:-${DISK}/hrm_text_pretrain_logs/rwkv_mem_posttrain/${RUN_ID}}"
 PID_FILE="${PID_FILE:-${LOG_DIR}/train.pid}"
@@ -23,7 +24,7 @@ SECONDS_PER_STEP="${SECONDS_PER_STEP:-46.5}"
 LR="${LR:-2e-4}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-20}"
 RWKV_MEM_MODE="${RWKV_MEM_MODE:-delta_rule}"
-RWKV_MEM_DELTA_HEADS="${RWKV_MEM_DELTA_HEADS:-[q,o]}"
+RWKV_MEM_DELTA_HEADS="${RWKV_MEM_DELTA_HEADS:-[q,k,v,o]}"
 RWKV_MEM_RANK="${RWKV_MEM_RANK:-8}"
 RWKV_MEM_ALPHA="${RWKV_MEM_ALPHA:-16.0}"
 RWKV_MEM_BETA_BIAS_INIT="${RWKV_MEM_BETA_BIAS_INIT:--1.5}"
@@ -175,14 +176,20 @@ start_training() {
     echo "resume_tag=${resume_tag:-none}"
     echo "checkpoint_dir=${CKPT_DIR}"
     echo "log=${log_path}"
+    echo "delta_mem_repo=${DELTA_MEM_REPO}"
   } > "${manifest_path}"
 
   cd "${ROOT_DIR}"
+  local pythonpath="${PYTHONPATH:-}"
+  if [[ -d "${DELTA_MEM_REPO}/deltamem" ]]; then
+    pythonpath="${DELTA_MEM_REPO}${pythonpath:+:${pythonpath}}"
+  fi
   nohup setsid env \
     WANDB_MODE="${WANDB_MODE:-offline}" \
     PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
     PYTHONUNBUFFERED=1 \
     TOKENIZERS_PARALLELISM=false \
+    PYTHONPATH="${pythonpath}" \
     "${PYTHON_BIN}" "${args[@]}" >> "${log_path}" 2>&1 &
   echo "$!" > "${PID_FILE}"
 

@@ -39,7 +39,7 @@ class TransformerConfig(BaseModel):
     rope_theta: Optional[float] = None
 
     rwkv_mem_enabled: bool = False
-    rwkv_mem_mode: Literal["delta_rule", "rwkv7_legacy"] = "delta_rule"
+    rwkv_mem_mode: Literal["delta_rule", "rwkv7", "rwkv7_legacy"] = "delta_rule"
     rwkv_mem_head_size: int = 64
     rwkv_mem_backend: Literal["auto", "cuda", "torch"] = "auto"
     rwkv_mem_chunk_len: int = 16

@@ -21,7 +21,7 @@ H_override:
   rwkv_mem_scale: 1.0
   rwkv_mem_output_init: zero
   rwkv_mem_output_init_scale: 0.02
-  rwkv_mem_delta_heads: [q, o]
+  rwkv_mem_delta_heads: [q, k, v, o]
   rwkv_mem_separate_delta_projections: false
 
 bp_warmup_ratio: 0.2

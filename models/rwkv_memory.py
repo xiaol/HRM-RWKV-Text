@@ -9,6 +9,12 @@ import torch.nn.functional as F
 from models.common import unwrap_tensor
 from models.rwkv7 import RWKV7Config, RWKV7TimeMix
 
+try:
+    from deltamem.kernels.affine_scan import triton_affine_scan, triton_scan_support
+except Exception:  # pragma: no cover - optional local reference repo dependency
+    triton_affine_scan = None
+    triton_scan_support = None
+
 
 VALID_DELTA_MEM_HEADS = ("q", "k", "v", "o")
 VALID_DELTA_MEM_STATE_UPDATE_MODES = ("standard", "lambda_outside", "no_lambda")
@@ -45,6 +51,7 @@ class RWKVStateMemory(nn.Module):
         scale: float = 1.0,
         output_init: str = "zero",
         output_init_scale: float = 0.02,
+        **kwargs,
     ) -> None:
         super().__init__()
         self.scale = scale
@@ -60,6 +67,8 @@ class RWKVStateMemory(nn.Module):
         )
         self.time_mix = RWKV7TimeMix(config, layer_id=0)
         self._reset_output(output_init, output_init_scale)
+        if kwargs:
+            self.time_mix.to(**kwargs)
 
     def _reset_output(self, output_init: str, output_init_scale: float) -> None:
         if output_init == "zero":
@@ -149,6 +158,8 @@ class DeltaRuleStateMemory(nn.Module):
         delta_heads: Sequence[str] | str = ("q", "o"),
         output_init: str = "zero",
         output_init_scale: float = 0.02,
+        backend: str = "auto",
+        **kwargs,
     ) -> None:
         super().__init__()
         if rank < 1:
@@ -173,24 +184,27 @@ class DeltaRuleStateMemory(nn.Module):
         self.state_update_mode = state_update_mode
         self.rankwise_gates = bool(rankwise_gates)
         self.delta_heads = normalize_delta_mem_heads(delta_heads)
+        if backend not in {"auto", "cuda", "torch"}:
+            raise ValueError("delta-rule memory backend must be 'auto', 'cuda', or 'torch'")
+        self.backend = backend
 
         gate_dim = self.rank if self.rankwise_gates else 1
-        self.memory_q_proj = nn.Linear(hidden_size, self.rank, bias=False)
-        self.memory_k_proj = nn.Linear(hidden_size, self.rank, bias=False)
-        self.memory_v_proj = nn.Linear(hidden_size, self.rank, bias=False)
-        self.beta_proj = nn.Linear(hidden_size, gate_dim, bias=False)
-        self.beta_bias = nn.Parameter(torch.full((gate_dim,), self.beta_bias_init))
+        self.memory_q_proj = nn.Linear(hidden_size, self.rank, bias=False, **kwargs)
+        self.memory_k_proj = nn.Linear(hidden_size, self.rank, bias=False, **kwargs)
+        self.memory_v_proj = nn.Linear(hidden_size, self.rank, bias=False, **kwargs)
+        self.beta_proj = nn.Linear(hidden_size, gate_dim, bias=False, **kwargs)
+        self.beta_bias = nn.Parameter(torch.full((gate_dim,), self.beta_bias_init, **kwargs))
         if self.couple_lambda:
             self.lambda_proj = None
             self.lambda_bias = None
         else:
-            self.lambda_proj = nn.Linear(hidden_size, gate_dim, bias=False)
-            self.lambda_bias = nn.Parameter(torch.full((gate_dim,), -self.beta_bias_init))
+            self.lambda_proj = nn.Linear(hidden_size, gate_dim, bias=False, **kwargs)
+            self.lambda_bias = nn.Parameter(torch.full((gate_dim,), -self.beta_bias_init, **kwargs))
 
-        self.delta_q_proj = nn.Linear(self.rank, query_size, bias=False)
-        self.delta_k_proj = nn.Linear(self.rank, key_size, bias=False)
-        self.delta_v_proj = nn.Linear(self.rank, value_size, bias=False)
-        self.delta_o_proj = nn.Linear(self.rank, output_size, bias=False)
+        self.delta_q_proj = nn.Linear(self.rank, query_size, bias=False, **kwargs)
+        self.delta_k_proj = nn.Linear(self.rank, key_size, bias=False, **kwargs)
+        self.delta_v_proj = nn.Linear(self.rank, value_size, bias=False, **kwargs)
+        self.delta_o_proj = nn.Linear(self.rank, output_size, bias=False, **kwargs)
         self.reset_parameters(output_init, output_init_scale)
 
     def reset_parameters(self, output_init: str, output_init_scale: float) -> None:
@@ -224,8 +238,8 @@ class DeltaRuleStateMemory(nn.Module):
         memory_k = self.memory_k_proj(x)
         memory_v = self.memory_v_proj(x)
         if self.normalize_qk:
-            memory_q = F.normalize(memory_q.float(), dim=-1, eps=1e-6).to(dtype=x.dtype)
-            memory_k = F.normalize(memory_k.float(), dim=-1, eps=1e-6).to(dtype=x.dtype)
+            memory_q = F.normalize(torch.tanh(memory_q.float()), dim=-1, eps=1e-6).to(dtype=x.dtype)
+            memory_k = F.normalize(torch.tanh(memory_k.float()), dim=-1, eps=1e-6).to(dtype=x.dtype)
 
         beta = torch.sigmoid(self.beta_proj(x) + self.beta_bias.to(device=x.device, dtype=x.dtype))
         if self.rankwise_gates:
@@ -256,12 +270,19 @@ class DeltaRuleStateMemory(nn.Module):
             return torch.ones_like(beta), beta, beta
         raise ValueError(f"Unsupported state_update_mode: {self.state_update_mode}")
 
-    def _scan_batched(self, x: Tensor, token_mask: Optional[Tensor] = None) -> Tensor:
-        memory_q, memory_k, memory_v, beta, lam = self._project_memory(x)
-        keep, erase, write = self._update_coefficients(beta.float(), lam.float())
-
-        batch_size, seq_len, _ = x.shape
-        state = torch.zeros(batch_size, self.rank, self.rank, device=x.device, dtype=torch.float32)
+    def _scan_batched_torch(
+        self,
+        memory_q: Tensor,
+        memory_k: Tensor,
+        memory_v: Tensor,
+        keep: Tensor,
+        erase: Tensor,
+        write: Tensor,
+        token_mask: Optional[Tensor],
+        dtype: torch.dtype,
+    ) -> Tensor:
+        batch_size, seq_len, _ = memory_q.shape
+        state = torch.zeros(batch_size, self.rank, self.rank, device=memory_q.device, dtype=torch.float32)
         reads: list[Tensor] = []
         q_seq = memory_q.float()
         k_seq = memory_k.float()
@@ -271,13 +292,16 @@ class DeltaRuleStateMemory(nn.Module):
             q_t = q_seq[:, token_idx, :]
             k_t = k_seq[:, token_idx, :]
             v_t = v_seq[:, token_idx, :]
+            keep_t = keep[:, token_idx, :].unsqueeze(-1)
+            erase_t = erase[:, token_idx, :].unsqueeze(-1)
+            write_t = write[:, token_idx, :].unsqueeze(-1)
 
             read_t = torch.einsum("bij,bj->bi", state, q_t)
             pred_t = torch.einsum("bij,bj->bi", state, k_t)
             next_state = (
-                keep[:, token_idx, :] * state
-                - erase[:, token_idx, :] * pred_t.unsqueeze(-1) * k_t.unsqueeze(1)
-                + write[:, token_idx, :] * v_t.unsqueeze(-1) * k_t.unsqueeze(1)
+                keep_t * state
+                - erase_t * pred_t.unsqueeze(-1) * k_t.unsqueeze(1)
+                + write_t * v_t.unsqueeze(-1) * k_t.unsqueeze(1)
             )
 
             if token_mask is not None:
@@ -286,9 +310,48 @@ class DeltaRuleStateMemory(nn.Module):
                 read_t = read_t * valid.squeeze(-1)
             else:
                 state = next_state
-            reads.append(read_t.to(dtype=x.dtype))
+            reads.append(read_t.to(dtype=dtype))
 
         return torch.stack(reads, dim=1)
+
+    def _scan_batched(self, x: Tensor, token_mask: Optional[Tensor] = None) -> Tensor:
+        memory_q, memory_k, memory_v, beta, lam = self._project_memory(x)
+        keep, erase, write = self._update_coefficients(beta.float(), lam.float())
+
+        batch_size, seq_len, _ = x.shape
+        state = torch.zeros(batch_size, self.rank, self.rank, device=x.device, dtype=torch.float32)
+        q_seq = memory_q.float()
+        k_seq = memory_k.float()
+        v_seq = memory_v.float()
+        keep_seq = keep.squeeze(-1).float()
+        erase_seq = erase.squeeze(-1).float()
+        write_seq = write.squeeze(-1).float()
+
+        if self.backend in {"auto", "cuda"} and triton_affine_scan is not None and triton_scan_support is not None:
+            support = triton_scan_support(state, q_seq, k_seq, v_seq, keep_seq, erase_seq, write_seq)
+            if support.supported:
+                _state_out, reads = triton_affine_scan(
+                    state,
+                    q_seq,
+                    k_seq,
+                    v_seq,
+                    keep_seq,
+                    erase_seq,
+                    write_seq,
+                    token_mask,
+                )
+                return reads.to(dtype=x.dtype)
+
+        return self._scan_batched_torch(
+            memory_q=q_seq,
+            memory_k=k_seq,
+            memory_v=v_seq,
+            keep=keep_seq,
+            erase=erase_seq,
+            write=write_seq,
+            token_mask=token_mask,
+            dtype=x.dtype,
+        )
 
     def _project_delta(self, reads: Tensor, head: str, proj: nn.Linear) -> Optional[Tensor]:
         if head not in self.delta_heads:

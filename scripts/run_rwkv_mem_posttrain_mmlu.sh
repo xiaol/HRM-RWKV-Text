@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)}"
 DISK="${DISK:-/run/media/xiaol/B214449214445C0B}"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
+DELTA_MEM_REPO="${DELTA_MEM_REPO:-/home/xiaol/X/delta-Mem}"
 
 if ! findmnt "${DISK}" >/dev/null 2>&1; then
   udisksctl mount -b /dev/nvme1n1p2 >/dev/null || true
@@ -50,7 +51,7 @@ resolve_init_safetensors() {
 
 INIT_SAFETENSORS="$(resolve_init_safetensors)"
 
-RUN_ID="${RUN_ID:-hrm_h_delta_mem_qo_posttrain_mmlu_$(date +%Y%m%d_%H%M%S)}"
+RUN_ID="${RUN_ID:-hrm_h_delta_mem_qkvo_posttrain_mmlu_$(date +%Y%m%d_%H%M%S)}"
 CKPT_ROOT="${CKPT_ROOT:-${DISK}/hrm_text_pretrain_checkpoints/rwkv_mem_posttrain}"
 LOG_ROOT="${LOG_ROOT:-${DISK}/hrm_text_pretrain_logs/rwkv_mem_posttrain}"
 CKPT_DIR="${CKPT_DIR:-${CKPT_ROOT}/${RUN_ID}}"
@@ -69,7 +70,7 @@ LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-20}"
 LOG_INTERVAL="${LOG_INTERVAL:-1}"
 RUN_MMLU="${RUN_MMLU:-1}"
 TRAINABLE_PARAM_SUBSTRINGS="${TRAINABLE_PARAM_SUBSTRINGS:-[rwkv_mem]}"
-RWKV_MEM_DELTA_HEADS="${RWKV_MEM_DELTA_HEADS:-[q,o]}"
+RWKV_MEM_DELTA_HEADS="${RWKV_MEM_DELTA_HEADS:-[q,k,v,o]}"
 RWKV_MEM_MODE="${RWKV_MEM_MODE:-delta_rule}"
 RWKV_MEM_RANK="${RWKV_MEM_RANK:-8}"
 RWKV_MEM_ALPHA="${RWKV_MEM_ALPHA:-16.0}"
@@ -84,6 +85,9 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
+if [[ -d "${DELTA_MEM_REPO}/deltamem" ]]; then
+  export PYTHONPATH="${DELTA_MEM_REPO}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
 
 {
   echo "run_id=${RUN_ID}"
@@ -102,6 +106,7 @@ export TOKENIZERS_PARALLELISM=false
   echo "rwkv_mem_beta_bias_init=${RWKV_MEM_BETA_BIAS_INIT}"
   echo "rwkv_mem_state_update_mode=${RWKV_MEM_STATE_UPDATE_MODE}"
   echo "rwkv_mem_separate_delta_projections=${RWKV_MEM_SEPARATE_DELTA_PROJECTIONS}"
+  echo "delta_mem_repo=${DELTA_MEM_REPO}"
 } | tee "${LOG_ROOT}/${RUN_ID}.manifest"
 
 "${PYTHON_BIN}" pretrain.py \

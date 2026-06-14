@@ -18,7 +18,7 @@ Delta-Mem is a better conceptual direction because it keeps the full-attention b
 
 The first accepted experiment used the repo's existing RWKV-7 state recurrence as a q/o memory adapter. That was useful as a minimal proof of concept, but it was not the full delta-Mem mechanism.
 
-The current default implementation is now `rwkv_mem_mode: delta_rule`: a native HRM delta-rule associative memory that learns memory q/k/v projections, updates a compact online state, reads from that state, and injects q/k/v/o deltas into HRM attention. The old RWKV-7 reader remains available as `rwkv_mem_mode: rwkv7_legacy` for reproducing earlier checkpoints.
+The current default implementation is now `rwkv_mem_mode: delta_rule`: a native HRM delta-rule associative memory that learns memory q/k/v projections, updates a compact online state, reads from that state, and injects q/k/v/o deltas into HRM attention. `rwkv_mem_mode: rwkv7` is the separate comparison path: it uses an RWKV-7 state reader and projects that readout into q/k/v/o attention deltas. The old RWKV-7 reader remains available as `rwkv_mem_mode: rwkv7_legacy` for reproducing earlier checkpoints.
 
 ## What Delta-Mem Provides
 
@@ -50,7 +50,7 @@ Implemented adapter:
 - project hidden states to low-rank memory `q/k/v`;
 - read from an online associative state before writing the current token;
 - update the state with delta-rule keep/erase/write coefficients;
-- inject the memory readout into attention `q/k/v/o`, with `[q, o]` as the default active head set to match the released delta-Mem adapter shape;
+- inject the memory readout into attention `q/k/v/o`, with `[q, k, v, o]` as the full-recipe default and `[q, o]` kept for the released delta-Mem adapter comparison;
 - support packed PrefixLM batches by padding `[T, C]` into `[numseqs, max_len, C]`, scanning once, and scattering deltas back;
 - H-level only first through `H_override`.
 
@@ -70,7 +70,7 @@ H_override:
   rwkv_mem_beta_bias_init: -1.5
   rwkv_mem_state_update_mode: standard
   rwkv_mem_output_init: zero
-  rwkv_mem_delta_heads: [q, o]
+  rwkv_mem_delta_heads: [q, k, v, o]
   rwkv_mem_separate_delta_projections: false
 bp_warmup_ratio: 0.2
 bp_max_steps: 5
@@ -78,7 +78,7 @@ bp_max_steps: 5
 
 With `rwkv_mem_output_init=zero`, the model starts exactly as the Transformer baseline because all delta heads output zero. Adapter construction restores RNG state after initializing memory parameters, so later Transformer layers keep identical initialization.
 
-Current limitation: the HRM-native delta-rule scan is functionally correct but currently uses a PyTorch token loop. Upstream delta-Mem uses a Triton affine-scan kernel for speed; porting or reimplementing that kernel is the next performance step.
+Current limitation: the HRM-native delta-rule scan uses the upstream Triton affine-scan kernel only when the local `deltamem` package is importable; otherwise it falls back to a PyTorch CUDA token loop. Vendoring or locally packaging that kernel is the next speed task.
 
 ## First Experiments
 
@@ -126,4 +126,4 @@ Stop early if:
 
 Do not copy the upstream implementation directly unless licensing is clarified. The cloned repo does not include a top-level LICENSE file in the current checkout; it only advertises CC-BY-4.0 in the README badge.
 
-The HRM implementation should stay small and local. The current default keeps active heads at `q,o` for the first comparison, but the implementation supports q/k/v/o delta heads for controlled ablations.
+The HRM implementation should stay small and local. The current full default uses active heads `q,k,v,o`; use `q,o` only for the release-compatible delta-Mem comparison.
