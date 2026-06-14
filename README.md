@@ -175,9 +175,9 @@ value = value + delta_v(read)  # optional
 output = attention_out + delta_o(read)
 ```
 
-For `rwkv_mem_output_init=zero`, the adapter starts as an exact Transformer baseline: all delta heads are zero and adapter construction restores RNG state so later Transformer layers initialize identically. New full-recipe runs use `rwkv_mem_mode: delta_rule` and `rwkv_mem_delta_heads: [q, k, v, o]`. For release-compatible delta-Mem comparison, set `rwkv_mem_delta_heads: [q, o]`, matching the Q/O public Qwen adapter.
+For `rwkv_mem_output_init=zero`, the adapter starts as an exact Transformer baseline: all delta heads are zero and adapter construction restores RNG state so later Transformer layers initialize identically. New full-core runs use `rwkv_mem_mode: delta_rule` and `rwkv_mem_delta_heads: [q, k, v, o]`. For release-compatible delta-Mem comparison, set `rwkv_mem_delta_heads: [q, o]`, matching the Q/O public Qwen adapter.
 
-The RWKV-state comparison has two modes. `rwkv_mem_mode: rwkv7` reads from an RWKV-7 state path and projects that readout into q/k/v/o injection heads. `rwkv_mem_mode: rwkv7_legacy` keeps the older minimal q/o-compatible path for reproducing the accepted `step_200` run. Neither RWKV-state mode is the same as delta-Mem: the full delta-Mem recipe is the `delta_rule` associative state with learned memory q/k/v writes.
+The RWKV-state comparison has two modes. `rwkv_mem_mode: rwkv7` reads from an RWKV-7 state path and projects that readout into q/k/v/o injection heads. `rwkv_mem_mode: rwkv7_legacy` keeps the older minimal q/o-compatible path for reproducing the accepted `step_200` run. Neither RWKV-state mode is the same as delta-Mem: the full delta-Mem core mechanism is the `delta_rule` associative state with learned memory q/k/v writes and q/k/v/o deltas.
 
 ### Method Details
 
@@ -325,14 +325,14 @@ bash scripts/run_rwkv_qkv_vs_delta_mem_200.sh
 It runs:
 
 ```text
-delta_rule [q,k,v,o]   full HRM delta-Mem recipe, about 1.57M trainable params
+delta_rule [q,k,v,o]   full q/k/v/o delta-Mem core adapter, about 1.57M trainable params
 delta_rule [q,o]       release-compatible delta-Mem comparison, same memory q/k/v state
 rwkv7 [q,k,v,o]        RWKV-state memory comparison, about 321M trainable params
 ```
 
 The RWKV-state comparison is intentionally not parameter-matched with delta-Mem yet. It trains the RWKV7 reader plus q/k/v/o projections, so it answers a different question: whether an RWKV recurrent state can act as a stronger memory adapter. A later fair-size comparison should reduce or freeze the RWKV reader.
 
-The run reads from the complete prepared `176.24B`-token corpus, but the 200-step experiment is only a `39.3M`-token continuation, not a full epoch over that corpus.
+The run reads from the complete prepared `176.24B`-token corpus, but the 200-step experiment is only a `39.3M`-token continuation, not a full epoch over that corpus. This comparison uses HRM pretrain continuation and MMLU, not the upstream delta-Mem Qasper/SFT write-segmentation recipe.
 
 For quick iteration:
 
