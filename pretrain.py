@@ -165,6 +165,15 @@ def apply_trainable_filter(config: PretrainConfig, model: nn.Module, rank: int) 
     trainable_count = 0
     for name, param in model.named_parameters():
         trainable = any(pattern in name for pattern in patterns)
+        if trainable:
+            parts = name.split(".")
+            for prefix_len in range(len(parts) - 1, 0, -1):
+                parent_name = ".".join(parts[:prefix_len])
+                parent = model.get_submodule(parent_name)
+                if hasattr(parent, "is_trainable_parameter"):
+                    sub_name = ".".join(parts[prefix_len:])
+                    trainable = bool(parent.is_trainable_parameter(sub_name))  # type: ignore[attr-defined]
+                    break
         param.requires_grad_(trainable)
         if trainable:
             trainable_count += param.numel()

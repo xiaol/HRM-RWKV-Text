@@ -73,10 +73,15 @@ TRAINABLE_PARAM_SUBSTRINGS="${TRAINABLE_PARAM_SUBSTRINGS:-[rwkv_mem]}"
 RWKV_MEM_DELTA_HEADS="${RWKV_MEM_DELTA_HEADS:-[q,k,v,o]}"
 RWKV_MEM_MODE="${RWKV_MEM_MODE:-delta_rule}"
 RWKV_MEM_RANK="${RWKV_MEM_RANK:-8}"
+RWKV_MEM_NUM_STATE_HEADS="${RWKV_MEM_NUM_STATE_HEADS:-1}"
 RWKV_MEM_ALPHA="${RWKV_MEM_ALPHA:-16.0}"
 RWKV_MEM_BETA_BIAS_INIT="${RWKV_MEM_BETA_BIAS_INIT:--1.5}"
 RWKV_MEM_STATE_UPDATE_MODE="${RWKV_MEM_STATE_UPDATE_MODE:-standard}"
 RWKV_MEM_SEPARATE_DELTA_PROJECTIONS="${RWKV_MEM_SEPARATE_DELTA_PROJECTIONS:-false}"
+RWKV_MEM_OUTPUT_INIT="${RWKV_MEM_OUTPUT_INIT:-zero}"
+RWKV_MEM_BASE_SLICE_REF_WIDTH="${RWKV_MEM_BASE_SLICE_REF_WIDTH:-8}"
+RWKV_MEM_ONLINE_GAIN="${RWKV_MEM_ONLINE_GAIN:-0.05}"
+RWKV_MEM_MEMORY_WRITE_GRANULARITY="${RWKV_MEM_MEMORY_WRITE_GRANULARITY:-token}"
 
 mkdir -p "${CKPT_DIR}" "${LOG_ROOT}"
 
@@ -102,10 +107,15 @@ fi
   echo "rwkv_mem_mode=${RWKV_MEM_MODE}"
   echo "rwkv_mem_delta_heads=${RWKV_MEM_DELTA_HEADS}"
   echo "rwkv_mem_rank=${RWKV_MEM_RANK}"
+  echo "rwkv_mem_num_state_heads=${RWKV_MEM_NUM_STATE_HEADS}"
   echo "rwkv_mem_alpha=${RWKV_MEM_ALPHA}"
   echo "rwkv_mem_beta_bias_init=${RWKV_MEM_BETA_BIAS_INIT}"
   echo "rwkv_mem_state_update_mode=${RWKV_MEM_STATE_UPDATE_MODE}"
   echo "rwkv_mem_separate_delta_projections=${RWKV_MEM_SEPARATE_DELTA_PROJECTIONS}"
+  echo "rwkv_mem_output_init=${RWKV_MEM_OUTPUT_INIT}"
+  echo "rwkv_mem_base_slice_ref_width=${RWKV_MEM_BASE_SLICE_REF_WIDTH}"
+  echo "rwkv_mem_online_gain=${RWKV_MEM_ONLINE_GAIN}"
+  echo "rwkv_mem_memory_write_granularity=${RWKV_MEM_MEMORY_WRITE_GRANULARITY}"
   echo "delta_mem_repo=${DELTA_MEM_REPO}"
 } | tee "${LOG_ROOT}/${RUN_ID}.manifest"
 
@@ -133,12 +143,17 @@ fi
   log_interval="${LOG_INTERVAL}" \
   arch.H_override.rwkv_mem_mode="${RWKV_MEM_MODE}" \
   arch.H_override.rwkv_mem_backend=cuda \
+  arch.H_override.rwkv_mem_output_init="${RWKV_MEM_OUTPUT_INIT}" \
   arch.H_override.rwkv_mem_delta_heads="${RWKV_MEM_DELTA_HEADS}" \
   arch.H_override.rwkv_mem_rank="${RWKV_MEM_RANK}" \
+  arch.H_override.rwkv_mem_num_state_heads="${RWKV_MEM_NUM_STATE_HEADS}" \
   arch.H_override.rwkv_mem_alpha="${RWKV_MEM_ALPHA}" \
   arch.H_override.rwkv_mem_beta_bias_init="${RWKV_MEM_BETA_BIAS_INIT}" \
   arch.H_override.rwkv_mem_state_update_mode="${RWKV_MEM_STATE_UPDATE_MODE}" \
   arch.H_override.rwkv_mem_separate_delta_projections="${RWKV_MEM_SEPARATE_DELTA_PROJECTIONS}" \
+  arch.H_override.rwkv_mem_base_slice_ref_width="${RWKV_MEM_BASE_SLICE_REF_WIDTH}" \
+  arch.H_override.rwkv_mem_online_gain="${RWKV_MEM_ONLINE_GAIN}" \
+  arch.H_override.rwkv_mem_memory_write_granularity="${RWKV_MEM_MEMORY_WRITE_GRANULARITY}" \
   2>&1 | tee "${TRAIN_LOG}"
 
 if [[ "${RUN_MMLU}" == "1" ]]; then

@@ -165,12 +165,16 @@ class Attention(nn.Module):
         rwkv_mem_delta_heads: Sequence[str] = ("q", "k", "v", "o"),
         rwkv_mem_separate_delta_projections: bool = False,
         rwkv_mem_rank: int = 8,
+        rwkv_mem_num_state_heads: int = 1,
         rwkv_mem_alpha: float = 16.0,
         rwkv_mem_beta_bias_init: float = -1.5,
         rwkv_mem_normalize_qk: bool = True,
         rwkv_mem_couple_lambda: bool = True,
         rwkv_mem_state_update_mode: str = "standard",
         rwkv_mem_rankwise_gates: bool = True,
+        rwkv_mem_base_slice_ref_width: int = 8,
+        rwkv_mem_online_gain: float = 0.05,
+        rwkv_mem_memory_write_granularity: str = "token",
         **kwargs,
     ):
         super().__init__()
@@ -210,6 +214,7 @@ class Attention(nn.Module):
                         value_size=head_dim * num_key_value_heads,
                         output_size=hidden_size,
                         rank=rwkv_mem_rank,
+                        num_state_heads=rwkv_mem_num_state_heads,
                         alpha=rwkv_mem_alpha,
                         beta_bias_init=rwkv_mem_beta_bias_init,
                         normalize_qk=rwkv_mem_normalize_qk,
@@ -219,7 +224,19 @@ class Attention(nn.Module):
                         delta_heads=rwkv_mem_delta_heads,
                         output_init=rwkv_mem_output_init,
                         output_init_scale=rwkv_mem_output_init_scale,
+                        base_slice_ref_width=rwkv_mem_base_slice_ref_width,
+                        online_gain=rwkv_mem_online_gain,
+                        memory_write_granularity=rwkv_mem_memory_write_granularity,
                         backend=rwkv_mem_backend,
+                        base_q_weight=self.gqkv_proj.weight[self.num_heads * head_dim : 2 * self.num_heads * head_dim],
+                        base_k_weight=self.gqkv_proj.weight[
+                            2 * self.num_heads * head_dim : (2 * self.num_heads + self.num_key_value_heads) * head_dim
+                        ],
+                        base_v_weight=self.gqkv_proj.weight[
+                            (2 * self.num_heads + self.num_key_value_heads) * head_dim :
+                            (2 * self.num_heads + 2 * self.num_key_value_heads) * head_dim
+                        ],
+                        base_o_weight=self.o_proj.weight,
                         **kwargs,
                     )
                 else:

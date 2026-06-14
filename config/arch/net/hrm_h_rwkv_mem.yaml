@@ -15,6 +15,10 @@ H_override:
   rwkv_mem_couple_lambda: true
   rwkv_mem_state_update_mode: standard
   rwkv_mem_rankwise_gates: true
+  rwkv_mem_num_state_heads: 1
+  rwkv_mem_base_slice_ref_width: 8
+  rwkv_mem_online_gain: 0.05
+  rwkv_mem_memory_write_granularity: token
   rwkv_mem_head_size: 64
   rwkv_mem_backend: auto
   rwkv_mem_chunk_len: 16

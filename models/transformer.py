@@ -44,17 +44,21 @@ class TransformerConfig(BaseModel):
     rwkv_mem_backend: Literal["auto", "cuda", "torch"] = "auto"
     rwkv_mem_chunk_len: int = 16
     rwkv_mem_scale: float = 1.0
-    rwkv_mem_output_init: Literal["zero", "small"] = "zero"
+    rwkv_mem_output_init: Literal["zero", "small", "random", "base_slice", "base_slice_fixed"] = "zero"
     rwkv_mem_output_init_scale: float = 0.02
     rwkv_mem_delta_heads: tuple[str, ...] = ("q", "k", "v", "o")
     rwkv_mem_separate_delta_projections: bool = False
     rwkv_mem_rank: int = 8
+    rwkv_mem_num_state_heads: int = 1
     rwkv_mem_alpha: float = 16.0
     rwkv_mem_beta_bias_init: float = -1.5
     rwkv_mem_normalize_qk: bool = True
     rwkv_mem_couple_lambda: bool = True
     rwkv_mem_state_update_mode: Literal["standard", "lambda_outside", "no_lambda"] = "standard"
     rwkv_mem_rankwise_gates: bool = True
+    rwkv_mem_base_slice_ref_width: int = 8
+    rwkv_mem_online_gain: float = 0.05
+    rwkv_mem_memory_write_granularity: Literal["token", "message_mean", "sentence_mean"] = "token"
 
     # [Computed properties]
     @property
@@ -104,12 +108,16 @@ class TransformerBlock(nn.Module):
             rwkv_mem_delta_heads=config.rwkv_mem_delta_heads,
             rwkv_mem_separate_delta_projections=config.rwkv_mem_separate_delta_projections,
             rwkv_mem_rank=config.rwkv_mem_rank,
+            rwkv_mem_num_state_heads=config.rwkv_mem_num_state_heads,
             rwkv_mem_alpha=config.rwkv_mem_alpha,
             rwkv_mem_beta_bias_init=config.rwkv_mem_beta_bias_init,
             rwkv_mem_normalize_qk=config.rwkv_mem_normalize_qk,
             rwkv_mem_couple_lambda=config.rwkv_mem_couple_lambda,
             rwkv_mem_state_update_mode=config.rwkv_mem_state_update_mode,
             rwkv_mem_rankwise_gates=config.rwkv_mem_rankwise_gates,
+            rwkv_mem_base_slice_ref_width=config.rwkv_mem_base_slice_ref_width,
+            rwkv_mem_online_gain=config.rwkv_mem_online_gain,
+            rwkv_mem_memory_write_granularity=config.rwkv_mem_memory_write_granularity,
         )
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,

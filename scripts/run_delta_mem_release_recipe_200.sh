@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="${ROOT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)}"
+TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
+
+RUN_ID="${RUN_ID:-hrm_h_delta_mem_qo_tsw_s${MAX_STEPS:-200}_${TIMESTAMP}}"
+
+RUN_ID="${RUN_ID}" \
+RWKV_MEM_MODE=delta_rule \
+RWKV_MEM_DELTA_HEADS="${RWKV_MEM_DELTA_HEADS:-[q,o]}" \
+RWKV_MEM_RANK="${RWKV_MEM_RANK:-8}" \
+RWKV_MEM_NUM_STATE_HEADS="${RWKV_MEM_NUM_STATE_HEADS:-1}" \
+RWKV_MEM_ALPHA="${RWKV_MEM_ALPHA:-16.0}" \
+RWKV_MEM_BETA_BIAS_INIT="${RWKV_MEM_BETA_BIAS_INIT:--1.5}" \
+RWKV_MEM_STATE_UPDATE_MODE="${RWKV_MEM_STATE_UPDATE_MODE:-standard}" \
+RWKV_MEM_OUTPUT_INIT="${RWKV_MEM_OUTPUT_INIT:-base_slice_fixed}" \
+RWKV_MEM_BASE_SLICE_REF_WIDTH="${RWKV_MEM_BASE_SLICE_REF_WIDTH:-8}" \
+RWKV_MEM_ONLINE_GAIN="${RWKV_MEM_ONLINE_GAIN:-0.05}" \
+RWKV_MEM_MEMORY_WRITE_GRANULARITY="${RWKV_MEM_MEMORY_WRITE_GRANULARITY:-token}" \
+bash "${ROOT_DIR}/scripts/run_rwkv_mem_posttrain_mmlu.sh"

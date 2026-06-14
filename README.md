@@ -175,7 +175,7 @@ value = value + delta_v(read)  # optional
 output = attention_out + delta_o(read)
 ```
 
-For `rwkv_mem_output_init=zero`, the adapter starts as an exact Transformer baseline: all delta heads are zero and adapter construction restores RNG state so later Transformer layers initialize identically. New full-core runs use `rwkv_mem_mode: delta_rule` and `rwkv_mem_delta_heads: [q, k, v, o]`. For release-compatible delta-Mem comparison, set `rwkv_mem_delta_heads: [q, o]`, matching the Q/O public Qwen adapter.
+For `rwkv_mem_output_init=zero`, the adapter starts as an exact Transformer baseline: all delta heads are zero and adapter construction restores RNG state so later Transformer layers initialize identically. New full-core experiments can use `rwkv_mem_mode: delta_rule` and `rwkv_mem_delta_heads: [q, k, v, o]`. For an upstream release-style delta-Mem comparison, use `rwkv_mem_delta_heads: [q, o]`, `rwkv_mem_output_init: base_slice_fixed`, `rwkv_mem_memory_write_granularity: token`, `rwkv_mem_num_state_heads: 1`, and rank 8. That matches the public Qwen TSW/QO setup more closely than the earlier q/o-only zero-init run.
 
 The RWKV-state comparison has two modes. `rwkv_mem_mode: rwkv7` reads from an RWKV-7 state path and projects that readout into q/k/v/o injection heads. `rwkv_mem_mode: rwkv7_legacy` keeps the older minimal q/o-compatible path for reproducing the accepted `step_200` run. Neither RWKV-state mode is the same as delta-Mem: the full delta-Mem core mechanism is the `delta_rule` associative state with learned memory q/k/v writes and q/k/v/o deltas.
 
@@ -203,20 +203,24 @@ Important implementation choices:
 ```text
 rwkv_mem_mode: delta_rule
 rwkv_mem_rank: 8
+rwkv_mem_num_state_heads: 1
 rwkv_mem_alpha: 16.0
 rwkv_mem_beta_bias_init: -1.5
-rwkv_mem_output_init: zero
-rwkv_mem_delta_heads: [q, k, v, o]
+rwkv_mem_output_init: zero or base_slice_fixed
+rwkv_mem_delta_heads: [q, o] for release-style, [q, k, v, o] for expanded core
+rwkv_mem_base_slice_ref_width: 8
+rwkv_mem_online_gain: 0.05
+rwkv_mem_memory_write_granularity: token
 rwkv_mem_separate_delta_projections: false
 rwkv_mem_backend: cuda
 trainable_param_substrings: [rwkv_mem]
 ```
 
-Zero initialization makes the first forward pass exactly match the teacher checkpoint. The delta heads begin from no-op outputs; memory q/k/v and gate gradients start flowing after the delta heads move off zero. Use `rwkv_mem_output_init: small` only when immediate memory-gradient flow is worth losing exact teacher equivalence.
+Zero initialization makes the first forward pass exactly match the teacher checkpoint. The delta heads begin from no-op outputs; memory q/k/v and gate gradients start flowing after the delta heads move off zero. The upstream delta-Mem training scripts use `base_slice_fixed` with `online_gain=0.05`, so gradients reach the memory projections immediately but the initial model is no longer an exact no-op teacher.
 
 The `q` path is the main difference from an output-only residual adapter. Adding `delta_q(read)` before RoPE and attention changes the attention distribution itself, so the online memory state can steer which historical tokens the Transformer attends to. Full `[q,k,v,o]` additionally changes the written key/value content that attention consumes, then adds `delta_o(read)` after attention as a direct memory residual.
 
-The current implementation runs memory during full-prompt prefill. That is enough for MMLU in this repo because MMLU is a one-token multiple-choice generation benchmark: the answer logits come from the prompt prefill. Long-form autoregressive generation still needs persistent memory decode state before it should be treated as a target benchmark.
+The HRM pretrain continuation path uses packed PrefixLM examples, so token-wise TSW writes are the only upstream write granularity that is directly meaningful here. Upstream SSW/MSW modes require chat/episode write span IDs; the config accepts `message_mean`, `sentence_mean`, and multi-state heads, but HRM pretrain batches currently do not provide those IDs. The current implementation runs memory during full-prompt prefill. That is enough for MMLU in this repo because MMLU is a one-token multiple-choice generation benchmark: the answer logits come from the prompt prefill. Long-form autoregressive generation still needs persistent memory decode state before it should be treated as a target benchmark.
 
 Performance caveat: the HRM-native delta-rule path can use the upstream Triton affine-scan kernel if the local `deltamem` package is importable; otherwise it falls back to a PyTorch CUDA token loop. RWKV7 memory uses the repo's LT2 RWKV kernels when `rwkv_mem_backend=cuda`.
 
@@ -292,6 +296,12 @@ Primary launch:
 bash scripts/run_rwkv_mem_posttrain_mmlu.sh
 ```
 
+Upstream release-style launch:
+
+```bash
+bash scripts/run_delta_mem_release_recipe_200.sh
+```
+
 Default recipe:
 
 ```text
@@ -302,8 +312,13 @@ arch size: XL / HRM-Text-1B shape
 rwkv_mem_delta_heads: [q, k, v, o]
 rwkv_mem_mode: delta_rule
 rwkv_mem_rank: 8
+rwkv_mem_num_state_heads: 1
 rwkv_mem_alpha: 16.0
 rwkv_mem_beta_bias_init: -1.5
+rwkv_mem_output_init: zero
+rwkv_mem_base_slice_ref_width: 8
+rwkv_mem_online_gain: 0.05
+rwkv_mem_memory_write_granularity: token
 rwkv_mem_separate_delta_projections: false
 global_batch_size: 196608
 micro_batch_size: 512
@@ -330,9 +345,15 @@ delta_rule [q,o]       release-compatible delta-Mem comparison, same memory q/k/
 rwkv7 [q,k,v,o]        RWKV-state memory comparison, about 321M trainable params
 ```
 
+The stricter release-style recipe is separate:
+
+```text
+delta_rule [q,o], TSW token writes, base_slice_fixed output init, rank 8, one state head
+```
+
 The RWKV-state comparison is intentionally not parameter-matched with delta-Mem yet. It trains the RWKV7 reader plus q/k/v/o projections, so it answers a different question: whether an RWKV recurrent state can act as a stronger memory adapter. A later fair-size comparison should reduce or freeze the RWKV reader.
 
-The run reads from the complete prepared `176.24B`-token corpus, but the 200-step experiment is only a `39.3M`-token continuation, not a full epoch over that corpus. This comparison uses HRM pretrain continuation and MMLU, not the upstream delta-Mem Qasper/SFT write-segmentation recipe.
+The run reads from the complete prepared `176.24B`-token corpus, but the 200-step experiment is only a `39.3M`-token continuation, not a full epoch over that corpus. This comparison uses HRM pretrain continuation and MMLU. It now supports the upstream TSW/QO/core settings, but it still does not reproduce the upstream Qasper/SFT episode objective unless we add an HRM chat/episode collator with write spans.
 
 For quick iteration:
 

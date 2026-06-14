@@ -194,12 +194,16 @@ def _rwkv_mem_config(args: argparse.Namespace) -> dict:
         "rwkv_mem_delta_heads": tuple(x.strip() for x in args.rwkv_mem_delta_heads.split(",") if x.strip()),
         "rwkv_mem_separate_delta_projections": args.rwkv_mem_separate_delta_projections,
         "rwkv_mem_rank": args.rwkv_mem_rank,
+        "rwkv_mem_num_state_heads": args.rwkv_mem_num_state_heads,
         "rwkv_mem_alpha": args.rwkv_mem_alpha,
         "rwkv_mem_beta_bias_init": args.rwkv_mem_beta_bias_init,
         "rwkv_mem_normalize_qk": args.rwkv_mem_normalize_qk,
         "rwkv_mem_couple_lambda": args.rwkv_mem_couple_lambda,
         "rwkv_mem_state_update_mode": args.rwkv_mem_state_update_mode,
         "rwkv_mem_rankwise_gates": args.rwkv_mem_rankwise_gates,
+        "rwkv_mem_base_slice_ref_width": args.rwkv_mem_base_slice_ref_width,
+        "rwkv_mem_online_gain": args.rwkv_mem_online_gain,
+        "rwkv_mem_memory_write_granularity": args.rwkv_mem_memory_write_granularity,
     }
 
 
@@ -660,17 +664,21 @@ def main() -> None:
     parser.add_argument("--rwkv-mem-backend", default="auto", choices=["auto", "cuda", "torch"])
     parser.add_argument("--rwkv-mem-chunk-len", type=int, default=16)
     parser.add_argument("--rwkv-mem-scale", type=float, default=1.0)
-    parser.add_argument("--rwkv-mem-output-init", default="zero", choices=["zero", "small"])
+    parser.add_argument("--rwkv-mem-output-init", default="zero", choices=["zero", "small", "random", "base_slice", "base_slice_fixed"])
     parser.add_argument("--rwkv-mem-output-init-scale", type=float, default=0.02)
     parser.add_argument("--rwkv-mem-delta-heads", default="q,k,v,o", help="Comma-separated memory injection points: q,k,v,o")
     parser.add_argument("--rwkv-mem-separate-delta-projections", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--rwkv-mem-rank", type=int, default=8)
+    parser.add_argument("--rwkv-mem-num-state-heads", type=int, default=1)
     parser.add_argument("--rwkv-mem-alpha", type=float, default=16.0)
     parser.add_argument("--rwkv-mem-beta-bias-init", type=float, default=-1.5)
     parser.add_argument("--rwkv-mem-normalize-qk", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rwkv-mem-couple-lambda", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rwkv-mem-state-update-mode", default="standard", choices=["standard", "lambda_outside", "no_lambda"])
     parser.add_argument("--rwkv-mem-rankwise-gates", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--rwkv-mem-base-slice-ref-width", type=int, default=8)
+    parser.add_argument("--rwkv-mem-online-gain", type=float, default=0.05)
+    parser.add_argument("--rwkv-mem-memory-write-granularity", default="token", choices=["token", "message_mean", "sentence_mean"])
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1234)
