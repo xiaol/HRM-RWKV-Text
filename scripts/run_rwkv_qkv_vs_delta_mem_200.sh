@@ -24,4 +24,4 @@ run_one() {
 
 run_one "hrm_h_delta_mem_qkvo_s${MAX_STEPS}_${TIMESTAMP}" "delta_rule" "[q,k,v,o]"
 run_one "hrm_h_delta_mem_qo_s${MAX_STEPS}_${TIMESTAMP}" "delta_rule" "[q,o]"
-run_one "hrm_h_rwkv7_mem_qkv_s${MAX_STEPS}_${TIMESTAMP}" "rwkv7" "[q,k,v]"
+run_one "hrm_h_rwkv7_mem_qkvo_s${MAX_STEPS}_${TIMESTAMP}" "rwkv7" "[q,k,v,o]"

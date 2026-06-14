@@ -327,10 +327,10 @@ It runs:
 ```text
 delta_rule [q,k,v,o]   full HRM delta-Mem recipe, about 1.57M trainable params
 delta_rule [q,o]       release-compatible delta-Mem comparison, same memory q/k/v state
-rwkv7 [q,k,v]          RWKV-state memory comparison, about 283M trainable params
+rwkv7 [q,k,v,o]        RWKV-state memory comparison, about 321M trainable params
 ```
 
-The RWKV-state comparison is intentionally not parameter-matched with delta-Mem yet. It trains the RWKV7 reader plus q/k/v projections, so it answers a different question: whether an RWKV recurrent state can act as a stronger memory adapter. A later fair-size comparison should reduce or freeze the RWKV reader.
+The RWKV-state comparison is intentionally not parameter-matched with delta-Mem yet. It trains the RWKV7 reader plus q/k/v/o projections, so it answers a different question: whether an RWKV recurrent state can act as a stronger memory adapter. A later fair-size comparison should reduce or freeze the RWKV reader.
 
 The run reads from the complete prepared `176.24B`-token corpus, but the 200-step experiment is only a `39.3M`-token continuation, not a full epoch over that corpus.
 
