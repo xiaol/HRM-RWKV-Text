@@ -155,7 +155,7 @@ class DeltaRuleStateMemory(nn.Module):
         couple_lambda: bool = True,
         state_update_mode: str = "standard",
         rankwise_gates: bool = True,
-        delta_heads: Sequence[str] | str = ("q", "o"),
+        delta_heads: Sequence[str] | str = ("q", "k", "v", "o"),
         output_init: str = "zero",
         output_init_scale: float = 0.02,
         backend: str = "auto",

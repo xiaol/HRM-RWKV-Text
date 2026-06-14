@@ -162,7 +162,7 @@ class Attention(nn.Module):
         rwkv_mem_scale: float = 1.0,
         rwkv_mem_output_init: str = "zero",
         rwkv_mem_output_init_scale: float = 0.02,
-        rwkv_mem_delta_heads: Sequence[str] = ("o",),
+        rwkv_mem_delta_heads: Sequence[str] = ("q", "k", "v", "o"),
         rwkv_mem_separate_delta_projections: bool = False,
         rwkv_mem_rank: int = 8,
         rwkv_mem_alpha: float = 16.0,

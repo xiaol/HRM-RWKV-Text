@@ -46,7 +46,7 @@ class TransformerConfig(BaseModel):
     rwkv_mem_scale: float = 1.0
     rwkv_mem_output_init: Literal["zero", "small"] = "zero"
     rwkv_mem_output_init_scale: float = 0.02
-    rwkv_mem_delta_heads: tuple[str, ...] = ("o",)
+    rwkv_mem_delta_heads: tuple[str, ...] = ("q", "k", "v", "o")
     rwkv_mem_separate_delta_projections: bool = False
     rwkv_mem_rank: int = 8
     rwkv_mem_alpha: float = 16.0
