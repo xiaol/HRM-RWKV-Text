@@ -50,7 +50,7 @@ Implemented adapter:
 - project hidden states to low-rank memory `q/k/v`;
 - read from an online associative state before writing the current token;
 - update the state with delta-rule keep/erase/write coefficients;
-- inject the memory readout into attention `q/k/v/o`, with `[q, k, v, o]` as the full HRM recipe default and `[q, o]` kept only for the released Qwen TSW adapter comparison;
+- inject the memory readout into attention `q/k/v/o`, with `[q, k, v, o]` as the original-style HRM recipe default;
 - support packed PrefixLM batches by padding `[T, C]` into `[numseqs, max_len, C]`, scanning once, and scattering deltas back;
 - H-level only first through `H_override`.
 
@@ -126,4 +126,4 @@ Stop early if:
 
 Do not copy the upstream implementation directly unless licensing is clarified. The cloned repo does not include a top-level LICENSE file in the current checkout; it only advertises CC-BY-4.0 in the README badge.
 
-The HRM implementation should stay small and local. The current full default uses active heads `q,k,v,o`; use `q,o` only for the release-compatible delta-Mem comparison.
+The HRM implementation should stay small and local. The current full default uses active heads `q,k,v,o` and plain CE with no teacher KL term.

@@ -75,14 +75,14 @@ ema: null
 compile_train: false
 ```
 
-Why adapter-only first: zero-init makes the starting model identical to the original checkpoint, and adapter-only updates limit MMLU regression risk. The full active head set is `q,k,v,o`; use `q,o` as a separate release-compatible delta-Mem comparison because the public Qwen adapter is described as Q/O. The implementation has the full memory-side recipe: learned memory q/k/v, delta-rule online state update, and q/k/v/o attention deltas. With zero delta heads, memory q/k/v gradients begin after the delta heads move off zero; use `rwkv_mem_output_init: small` only for experiments that do not require exact step-0 teacher equivalence. If MMLU improves or stays close while validation CE improves, Stage B can unfreeze more H-level parameters at a lower LR.
+Why adapter-only first: zero-init makes the starting model identical to the original checkpoint, and adapter-only updates limit MMLU regression risk. The original-style baseline uses the full active head set `q,k,v,o` and plain CE with no teacher KL term. The implementation has the full memory-side recipe: learned memory q/k/v, delta-rule online state update, and q/k/v/o attention deltas. With zero delta heads, memory q/k/v gradients begin after the delta heads move off zero; use `rwkv_mem_output_init: small` only for experiments that do not require exact step-0 teacher equivalence. If MMLU improves or stays close while validation CE improves, Stage B can unfreeze more H-level parameters at a lower LR.
 
 ## Launch
 
 Default full-data post-train for 200 optimizer steps plus MMLU:
 
 ```bash
-bash scripts/run_rwkv_mem_posttrain_mmlu.sh
+bash scripts/run_delta_mem_original_baseline_200.sh
 ```
 
 Fast 10B-slice iteration:
@@ -101,13 +101,13 @@ bash scripts/run_rwkv_qkv_mem_vs_delta_mem_200.sh
 
 This runs HRM delta-rule memory `[q,k,v,o]` against RWKV-state memory `[q,k,v,o]` for the current 200-step comparison. The RWKV-state comparison now uses read-before-write timing, so token `t` reads `S_{t-1}` before its own write, matching delta-Mem's online memory semantics. The RWKV-state path is not parameter-matched yet; it trains the RWKV reader plus projection heads and is much larger than the delta-rule adapter.
 
-Release-compatible Q/O comparison:
+Compatibility comparison alias:
 
 ```bash
 bash scripts/run_delta_mem_recipe_vs_rwkv_mem_200.sh
 ```
 
-This reproduces the public delta-Mem adapter shape more closely by using `[q,o]` injection while still learning the memory-side q/k/v projections and token-wise delta-rule state.
+This now launches the fair q/k/v/o CE-only comparison. Use explicit environment overrides only for local ablations.
 
 Smoke without MMLU:
 
@@ -150,7 +150,7 @@ Updated implementation note:
 ```text
 current default: rwkv_mem_mode=delta_rule
 memory state: learned low-rank q/k/v with keep/erase/write delta-rule scan
-active delta heads: q,o by default; k,v are supported for ablations
+active delta heads: q,k,v,o
 RWKV-state comparison: set rwkv_mem_mode=rwkv7 for read-before-write previous-context memory
 legacy reproduction: set rwkv_mem_mode=rwkv7_legacy for the older write-before-read RWKV-7 state-reader adapter
 performance caveat: the native HRM scan is currently a PyTorch loop, not the upstream Triton affine scan
