@@ -93,13 +93,21 @@ MAX_STEPS=200 \
 bash scripts/run_rwkv_mem_posttrain_mmlu.sh
 ```
 
-Comparison launch:
+Fair q/k/v/o comparison launch:
 
 ```bash
-bash scripts/run_rwkv_qkv_vs_delta_mem_200.sh
+bash scripts/run_rwkv_qkv_mem_vs_delta_mem_200.sh
 ```
 
-This runs full delta-Mem `[q,k,v,o]`, release-compatible delta-Mem `[q,o]`, and RWKV-state memory `[q,k,v]`. The RWKV-state path is not parameter-matched yet; it trains the RWKV reader plus projection heads and is much larger than the delta-rule adapter.
+This runs HRM delta-rule memory `[q,k,v,o]` against RWKV-state memory `[q,k,v,o]` for the current 200-step comparison. The RWKV-state comparison now uses read-before-write timing, so token `t` reads `S_{t-1}` before its own write, matching delta-Mem's online memory semantics. The RWKV-state path is not parameter-matched yet; it trains the RWKV reader plus projection heads and is much larger than the delta-rule adapter.
+
+Release-compatible Q/O comparison:
+
+```bash
+bash scripts/run_delta_mem_recipe_vs_rwkv_mem_200.sh
+```
+
+This reproduces the public delta-Mem adapter shape more closely by using `[q,o]` injection while still learning the memory-side q/k/v projections and token-wise delta-rule state.
 
 Smoke without MMLU:
 
@@ -143,7 +151,8 @@ Updated implementation note:
 current default: rwkv_mem_mode=delta_rule
 memory state: learned low-rank q/k/v with keep/erase/write delta-rule scan
 active delta heads: q,o by default; k,v are supported for ablations
-legacy reproduction: set rwkv_mem_mode=rwkv7_legacy for the older RWKV-7 state-reader adapter
+RWKV-state comparison: set rwkv_mem_mode=rwkv7 for read-before-write previous-context memory
+legacy reproduction: set rwkv_mem_mode=rwkv7_legacy for the older write-before-read RWKV-7 state-reader adapter
 performance caveat: the native HRM scan is currently a PyTorch loop, not the upstream Triton affine scan
 ```
 

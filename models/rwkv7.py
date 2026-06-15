@@ -62,6 +62,39 @@ def rwkv7_recurrence_torch(r: Tensor, w: Tensor, k: Tensor, v: Tensor, a: Tensor
     return torch.stack(out, dim=1).reshape(B, T, C)
 
 
+def rwkv7_recurrence_read_before_write_torch(
+    r: Tensor,
+    w: Tensor,
+    k: Tensor,
+    v: Tensor,
+    a: Tensor,
+    b: Tensor,
+    head_size: int,
+) -> Tensor:
+    B, T, C = r.shape
+    H = C // head_size
+    dtype = r.dtype
+    r = r.reshape(B, T, H, head_size)
+    k = k.reshape(B, T, H, head_size)
+    v = v.reshape(B, T, H, head_size)
+    a = a.reshape(B, T, H, head_size)
+    b = b.reshape(B, T, H, head_size)
+    decay = torch.exp(-torch.exp(w.float())).reshape(B, T, H, head_size)
+    state = torch.zeros(B, H, head_size, head_size, device=r.device, dtype=torch.float32)
+    out = []
+    for t in range(T):
+        rt = r[:, t].float()
+        kt = k[:, t].float()
+        vt = v[:, t].float()
+        at = a[:, t].float()
+        bt = b[:, t].float()
+        wt = decay[:, t]
+        out.append((state * rt.unsqueeze(-2)).sum(dim=-1).to(dtype))
+        sa = (state * at.unsqueeze(-2)).sum(dim=-1)
+        state = state * wt.unsqueeze(-2) + vt.unsqueeze(-1) * kt.unsqueeze(-2) + sa.unsqueeze(-1) * bt.unsqueeze(-2)
+    return torch.stack(out, dim=1).reshape(B, T, C)
+
+
 class RWKV7Config(BaseModel):
     max_seq_len: int
     n_layers: int

@@ -175,9 +175,9 @@ value = value + delta_v(read)  # optional
 output = attention_out + delta_o(read)
 ```
 
-For `rwkv_mem_output_init=zero`, the adapter starts as an exact Transformer baseline: all delta heads are zero and adapter construction restores RNG state so later Transformer layers initialize identically. The upstream released delta-Mem recipe is not "q/o memory only": it learns memory q/k/v projections, updates an online delta-rule state, reads that state with memory q, and injects Q/O deltas in the released Qwen TSW adapter. Expanded experiments can also enable `[q,k,v,o]` injection, but the release-style comparison is `[q,o]` with `base_slice_fixed`, `online_gain=0.05`, rank 8, one state head, and token writes.
+For `rwkv_mem_output_init=zero`, the adapter starts as an exact Transformer baseline: all delta heads are zero and adapter construction restores RNG state so later Transformer layers initialize identically. The upstream released Qwen TSW adapter uses Q/O injection, but the code supports all active delta heads. In this fork, the full HRM delta-memory recipe is `[q,k,v,o]`: learned memory q/k/v projections, online delta-rule state, q/k/v changes before attention, and o residual after attention. The release-compatible comparison remains `[q,o]` with `base_slice_fixed`, `online_gain=0.05`, rank 8, one state head, and token writes.
 
-The RWKV-state comparison has two modes. `rwkv_mem_mode: rwkv7` reads from an RWKV-7 state path and projects that readout into q/k/v/o injection heads. `rwkv_mem_mode: rwkv7_legacy` keeps the older minimal q/o-compatible path for reproducing the accepted `step_200` run. Neither RWKV-state mode is the same as delta-Mem: the full delta-Mem core mechanism is the `delta_rule` associative state with learned memory q/k/v writes and q/k/v/o deltas.
+The RWKV-state comparison has two modes. `rwkv_mem_mode: rwkv7` reads from an RWKV-7 state path and projects that readout into q/k/v/o injection heads. For a fair online-memory comparison, this mode now reads before writing the current token, matching delta-Mem timing: token `t` sees `S_{t-1}`, then updates to `S_t`. `rwkv_mem_mode: rwkv7_legacy` keeps the older write-before-read path for reproducing accepted legacy runs. Neither RWKV-state mode is the same as delta-Mem: the full delta-Mem core mechanism is the `delta_rule` associative state with learned memory q/k/v writes and q/k/v/o deltas.
 
 ### Method Details
 
@@ -206,8 +206,8 @@ rwkv_mem_rank: 8
 rwkv_mem_num_state_heads: 1
 rwkv_mem_alpha: 16.0
 rwkv_mem_beta_bias_init: -1.5
-rwkv_mem_output_init: base_slice_fixed for release-style, zero for exact teacher no-op
-rwkv_mem_delta_heads: [q, o] for release-style, [q, k, v, o] for expanded injection ablation
+rwkv_mem_output_init: base_slice_fixed for recipe-style training, zero for exact teacher no-op
+rwkv_mem_delta_heads: [q, k, v, o] for full HRM memory, [q, o] for released Qwen TSW comparison
 rwkv_mem_base_slice_ref_width: 8
 rwkv_mem_online_gain: 0.05
 rwkv_mem_memory_write_granularity: token
@@ -220,11 +220,11 @@ rwkv_mem_kl_weight: 0.02
 
 Zero initialization makes the first forward pass exactly match the teacher checkpoint. The delta heads begin from no-op outputs; memory q/k/v and gate gradients start flowing after the delta heads move off zero. The upstream delta-Mem training scripts use `base_slice_fixed` with `online_gain=0.05`, so gradients reach the memory projections immediately but the initial model is no longer an exact no-op teacher.
 
-The `q` path is the main difference from an output-only residual adapter. Adding `delta_q(read)` before RoPE and attention changes the attention distribution itself, so the online memory state can steer which historical tokens the Transformer attends to. The released recipe also adds `delta_o(read)` after attention as a direct memory residual. Full `[q,k,v,o]` additionally changes the key/value content consumed by attention, but that is an HRM-side ablation rather than the public Qwen adapter setting.
+The `q` path is the main difference from an output-only residual adapter. Adding `delta_q(read)` before RoPE and attention changes the attention distribution itself, so the online memory state can steer which historical tokens the Transformer attends to. Full `[q,k,v,o]` also changes the key/value content consumed by attention and adds `delta_o(read)` after attention as a direct memory residual. The public Qwen TSW release is the narrower `[q,o]` setting.
 
 The HRM pretrain continuation path uses packed PrefixLM examples, so token-wise TSW writes are the only upstream write granularity that is directly meaningful here. Upstream SSW/MSW modes require chat/episode write span IDs; HRM pretrain batches currently do not provide those IDs. The local recipe-style training objective now supports CE plus teacher KL by disabling the memory adapter inside the same frozen teacher model for the reference logits. This is closer to upstream than plain CE, but it still is not the full Qasper episode objective until an HRM chat/episode collator supplies write/read spans and state-only/no-memory ablations.
 
-Performance caveat: the HRM-native delta-rule path can use the upstream Triton affine-scan kernel if the local `deltamem` package is importable; otherwise it falls back to a PyTorch CUDA token loop. RWKV7 memory uses the repo's LT2 RWKV kernels when `rwkv_mem_backend=cuda`.
+Performance caveat: the HRM-native delta-rule path can use the upstream Triton affine-scan kernel if the local `deltamem` package is importable; otherwise it falls back to a PyTorch CUDA token loop. RWKV7 memory uses the repo's LT2 CUDA kernels when `rwkv_mem_backend=cuda`, input tensors are CUDA bf16, `rwkv_mem_head_size=64`, and `rwkv_mem_chunk_len=16`. The corrected read-before-write RWKV-memory path reuses the LT2 recurrence with shifted read vectors, so token `t` reads `S_{t-1}` while preserving the tested CUDA recurrence/backward kernel. `rwkv7_legacy` remains available for the original write-before-read timing.
 
 First H-only V1 comparison on RTX 4090:
 
@@ -298,7 +298,7 @@ Primary launch:
 bash scripts/run_rwkv_mem_posttrain_mmlu.sh
 ```
 
-Upstream release-style launch:
+Release-compatible Q/O launch:
 
 ```bash
 bash scripts/run_delta_mem_release_recipe_200.sh
@@ -310,14 +310,14 @@ Release-style delta-Mem versus RWKV-state memory comparison:
 bash scripts/run_delta_mem_recipe_vs_rwkv_mem_200.sh
 ```
 
-Default recipe:
+Full HRM recipe:
 
 ```text
 data: /run/media/xiaol/B214449214445C0B/hrm_text_full_v1
 init: /run/media/xiaol/B214449214445C0B/hrm_text_eval_checkpoints/hrm_text_1b_teacher/model.safetensors
 trainable params: rwkv_mem only
 arch size: XL / HRM-Text-1B shape
-rwkv_mem_delta_heads: [q, o]
+rwkv_mem_delta_heads: [q, k, v, o]
 rwkv_mem_mode: delta_rule
 rwkv_mem_rank: 8
 rwkv_mem_num_state_heads: 1
@@ -335,24 +335,23 @@ micro_batch_size: 512
 gradient accumulation: 384
 optimizer steps: 200
 training-token exposure: 39,321,600
-trainable adapter params: 1,179,776
+trainable adapter params: about 1.57M
 total params: 1,184,366,720
 lr: 2e-4
 MMLU target: > 0.6088
 ```
 
-Expanded q/k/v/o ablation launcher:
+Fair q/k/v/o comparison launcher:
 
 ```bash
-bash scripts/run_rwkv_qkv_vs_delta_mem_200.sh
+bash scripts/run_rwkv_qkv_mem_vs_delta_mem_200.sh
 ```
 
 It runs:
 
 ```text
-delta_rule [q,k,v,o]   full q/k/v/o delta-Mem core adapter, about 1.57M trainable params
-delta_rule [q,o]       release-compatible delta-Mem comparison, same memory q/k/v state
-rwkv7 [q,k,v,o]        RWKV-state memory comparison, about 321M trainable params
+delta_rule [q,k,v,o]   HRM delta-rule memory adapter with q/k/v injection plus o residual
+rwkv7 [q,k,v,o]        RWKV-state memory comparison with q/k/v injection plus o residual
 ```
 
 Current release-style comparison launcher:

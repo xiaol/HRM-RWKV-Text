@@ -18,7 +18,7 @@ Delta-Mem is a better conceptual direction because it keeps the full-attention b
 
 The first accepted experiment used the repo's existing RWKV-7 state recurrence as a q/o memory adapter. That was useful as a minimal proof of concept, but it was not the full delta-Mem mechanism.
 
-The current default implementation is now `rwkv_mem_mode: delta_rule`: a native HRM delta-rule associative memory that learns memory q/k/v projections, updates a compact online state, reads from that state, and injects q/k/v/o deltas into HRM attention. `rwkv_mem_mode: rwkv7` is the separate comparison path: it uses an RWKV-7 state reader and projects that readout into q/k/v/o attention deltas. The old RWKV-7 reader remains available as `rwkv_mem_mode: rwkv7_legacy` for reproducing earlier checkpoints.
+The current default implementation is now `rwkv_mem_mode: delta_rule`: a native HRM delta-rule associative memory that learns memory q/k/v projections, updates a compact online state, reads from that state, and injects q/k/v/o deltas into HRM attention. `rwkv_mem_mode: rwkv7` is the separate comparison path: it uses an RWKV-7 state reader and projects that readout into q/k/v/o attention deltas. This comparison path reads before writing the current token so it uses previous-context memory like delta-Mem. The old write-before-read RWKV-7 reader remains available as `rwkv_mem_mode: rwkv7_legacy` for reproducing earlier checkpoints.
 
 ## What Delta-Mem Provides
 
@@ -50,7 +50,7 @@ Implemented adapter:
 - project hidden states to low-rank memory `q/k/v`;
 - read from an online associative state before writing the current token;
 - update the state with delta-rule keep/erase/write coefficients;
-- inject the memory readout into attention `q/k/v/o`, with `[q, k, v, o]` as the full-recipe default and `[q, o]` kept for the released delta-Mem adapter comparison;
+- inject the memory readout into attention `q/k/v/o`, with `[q, k, v, o]` as the full HRM recipe default and `[q, o]` kept only for the released Qwen TSW adapter comparison;
 - support packed PrefixLM batches by padding `[T, C]` into `[numseqs, max_len, C]`, scanning once, and scattering deltas back;
 - H-level only first through `H_override`.
 

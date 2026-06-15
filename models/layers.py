@@ -264,6 +264,7 @@ class Attention(nn.Module):
                         scale=rwkv_mem_scale,
                         output_init=rwkv_mem_output_init,
                         output_init_scale=rwkv_mem_output_init_scale,
+                        read_before_write=rwkv_mem_mode == "rwkv7",
                         **kwargs,
                     )
                     force_projections = rwkv_mem_mode == "rwkv7"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Optional, Sequence
 
 import torch
@@ -8,7 +9,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from models.common import unwrap_tensor
-from models.rwkv7 import RWKV7Config, RWKV7TimeMix
+from models.rwkv7 import RWKV7Config, RWKV7TimeMix, _time_shift_delta, rwkv7_recurrence_read_before_write_torch
 
 try:
     from deltamem.kernels.affine_scan import triton_affine_scan, triton_scan_support
@@ -55,10 +56,12 @@ class RWKVStateMemory(nn.Module):
         scale: float = 1.0,
         output_init: str = "zero",
         output_init_scale: float = 0.02,
+        read_before_write: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
         self.scale = scale
+        self.read_before_write = bool(read_before_write)
         config = RWKV7Config(
             max_seq_len=max_seq_len,
             n_layers=1,
@@ -88,7 +91,129 @@ class RWKVStateMemory(nn.Module):
         else:
             raise ValueError(f"Unknown RWKV memory output init: {output_init}")
 
+    def _normalize_read_state(self, y: Tensor) -> Tensor:
+        tm = self.time_mix
+        B, T, C = y.shape
+        # No bias here: an empty state read must stay zero even after training.
+        return F.group_norm(
+            y.reshape(B * T, C),
+            num_groups=tm.ln_x.num_groups,
+            weight=tm.ln_x.weight.to(device=y.device, dtype=y.dtype),
+            bias=None,
+            eps=tm.ln_x.eps,
+        ).reshape(B, T, C)
+
+    def _forward_read_before_write_torch(self, x: Tensor) -> Tensor:
+        tm = self.time_mix
+        B, T, C = x.shape
+        if T == 0:
+            return x.new_zeros((B, T, C))
+        xx = _time_shift_delta(x)
+        xr = x + xx * tm.x_r.to(dtype=x.dtype).view(1, 1, -1)
+        xw = x + xx * tm.x_w.to(dtype=x.dtype).view(1, 1, -1)
+        xk = x + xx * tm.x_k.to(dtype=x.dtype).view(1, 1, -1)
+        xv = x + xx * tm.x_v.to(dtype=x.dtype).view(1, 1, -1)
+        xa = x + xx * tm.x_a.to(dtype=x.dtype).view(1, 1, -1)
+        xg = x + xx * tm.x_g.to(dtype=x.dtype).view(1, 1, -1)
+
+        r = tm.receptance(xr)
+        w = tm.w0.to(dtype=x.dtype).view(1, 1, -1) + (
+            torch.tanh(xw @ tm.w1.to(dtype=x.dtype)) @ tm.w2.to(dtype=x.dtype)
+        )
+        k = tm.key(xk)
+        v = tm.value(xv)
+        w = -F.softplus(-w.float()).to(dtype=x.dtype) - 0.5
+        a = torch.sigmoid(
+            tm.a0.to(dtype=x.dtype).view(1, 1, -1) + (xa @ tm.a1.to(dtype=x.dtype)) @ tm.a2.to(dtype=x.dtype)
+        )
+        g = torch.sigmoid(xg @ tm.g1.to(dtype=x.dtype)) @ tm.g2.to(dtype=x.dtype)
+        kk = k * tm.k_k.to(dtype=x.dtype).view(1, 1, -1)
+        kk = F.normalize(kk.reshape(B, T, tm.n_head, tm.head_size), dim=-1, p=2.0).reshape(B, T, C)
+        k = k * (1 + (a - 1) * tm.k_a.to(dtype=x.dtype).view(1, 1, -1))
+
+        y = rwkv7_recurrence_read_before_write_torch(r, w, k, v, -kk, kk * a, tm.head_size)
+        y = self._normalize_read_state(y)
+        return tm.output(y * g)
+
+    def _can_use_read_before_write_cuda(self, x: Tensor) -> bool:
+        tm = self.time_mix
+        return tm.backend != "torch" and x.is_cuda and x.dtype == torch.bfloat16 and tm.head_size == 64 and tm.chunk_len == 16
+
+    def _forward_read_before_write_cuda(self, x: Tensor) -> Tensor:
+        from apps.LT2 import rwkv7_cuda
+
+        tm = self.time_mix
+        x = x.contiguous()
+        B, T, C = x.shape
+        if T == 0:
+            return x.new_zeros((B, T, C))
+
+        xr, xw, xk, xv, xa, xg = rwkv7_cuda.tmix_mix6(
+            x,
+            tm.x_r.to(device=x.device, dtype=x.dtype),
+            tm.x_w.to(device=x.device, dtype=x.dtype),
+            tm.x_k.to(device=x.device, dtype=x.dtype),
+            tm.x_v.to(device=x.device, dtype=x.dtype),
+            tm.x_a.to(device=x.device, dtype=x.dtype),
+            tm.x_g.to(device=x.device, dtype=x.dtype),
+        )
+        r = tm.receptance(xr)
+        w = tm.w0.to(device=x.device, dtype=x.dtype).view(1, 1, -1) + (
+            torch.tanh(xw @ tm.w1.to(device=x.device, dtype=x.dtype)) @ tm.w2.to(device=x.device, dtype=x.dtype)
+        )
+        k = tm.key(xk)
+        v = tm.value(xv)
+        a = rwkv7_cuda.tmix_a_gate(
+            tm.a0.to(device=x.device, dtype=x.dtype),
+            (xa @ tm.a1.to(device=x.device, dtype=x.dtype)) @ tm.a2.to(device=x.device, dtype=x.dtype),
+        )
+        g = torch.sigmoid(xg @ tm.g1.to(device=x.device, dtype=x.dtype)) @ tm.g2.to(device=x.device, dtype=x.dtype)
+        k, neg_kk, kka = rwkv7_cuda.tmix_kk_pre(
+            k,
+            tm.k_k.to(device=x.device, dtype=x.dtype),
+            a,
+            tm.k_a.to(device=x.device, dtype=x.dtype),
+            tm.head_size,
+        )
+
+        # The LT2 kernel emits write-before-read y_t = S_t r_t.  Passing r_{t+1}
+        # and shifting the output back gives read-before-write y_t = S_{t-1} r_t.
+        r_next = torch.cat((r[:, 1:], torch.zeros_like(r[:, :1])), dim=1).contiguous()
+        y_shifted = rwkv7_cuda.rwkv7_recurrence_cuda_bf16(
+            r_next,
+            w,
+            k,
+            v,
+            neg_kk,
+            kka,
+            tm.head_size,
+            tm.chunk_len,
+        )
+        y = torch.cat((torch.zeros_like(y_shifted[:, :1]), y_shifted[:, :-1]), dim=1).contiguous()
+        y = self._normalize_read_state(y)
+        return tm.output(y * g)
+
     def _forward_batched(self, x: Tensor) -> Tensor:
+        if self.read_before_write:
+            if self._can_use_read_before_write_cuda(x):
+                try:
+                    return self._forward_read_before_write_cuda(x) * self.scale
+                except Exception as exc:
+                    if self.time_mix.backend == "cuda":
+                        raise
+                    warnings.warn(
+                        f"Falling back to PyTorch RWKV-memory read-before-write backend: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            elif self.time_mix.backend == "cuda":
+                raise RuntimeError(
+                    "RWKV-memory read-before-write CUDA requires a CUDA bfloat16 tensor, "
+                    "head_size=64, and chunk_len=16; "
+                    f"got device={x.device}, dtype={x.dtype}, "
+                    f"head_size={self.time_mix.head_size}, chunk_len={self.time_mix.chunk_len}"
+                )
+            return self._forward_read_before_write_torch(x) * self.scale
         y, _v_first = self.time_mix(x, v_first=None, reset_v_first=True)
         return y * self.scale
 
@@ -335,9 +460,10 @@ class DeltaRuleStateMemory(nn.Module):
                 slice_width = min(self.base_slice_ref_width, self.rank, self.state_read_dim, base_weight.shape[1])
             if slice_width <= 0:
                 return
-            base_slice = base_weight[:, :slice_width].detach().float()
+            copy_rows = min(proj.weight.shape[0], base_weight.shape[0])
+            base_slice = base_weight[:copy_rows, :slice_width].detach().float()
             base_slice = F.normalize(base_slice, dim=0, eps=1e-6)
-            proj.weight[:, :slice_width].copy_((base_slice * self.online_gain).to(dtype=proj.weight.dtype))
+            proj.weight[:copy_rows, :slice_width].copy_((base_slice * self.online_gain).to(dtype=proj.weight.dtype))
 
     def reset_parameters(
         self,
