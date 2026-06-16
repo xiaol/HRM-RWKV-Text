@@ -101,6 +101,17 @@ bash scripts/run_rwkv_qkv_mem_vs_delta_mem_200.sh
 
 This runs HRM delta-rule memory `[q,k,v,o]` against RWKV-state memory `[q,k,v,o]` for the current 200-step comparison. The RWKV-state comparison now uses read-before-write timing, so token `t` reads `S_{t-1}` before its own write, matching delta-Mem's online memory semantics. The RWKV-state path is not parameter-matched yet; it trains the RWKV reader plus projection heads and is much larger than the delta-rule adapter.
 
+Latest 200-step snapshot:
+
+| run | mode / heads / loss | final train loss | MMLU | invalid |
+| --- | --- | ---: | ---: | ---: |
+| HRM-Text-1B teacher | baseline | - | 0.6088 | 0.0005 |
+| original delta-Mem baseline | `delta_rule [q,k,v,o]`, CE | 0.22564 | 0.6089 | 0.0007 |
+| fair RWKV-state memory | `rwkv7 [q,k,v,o]`, CE | 0.22075 | 0.6075 | 0.0006 |
+| legacy RWKV q/o adapter | older q/o path | 0.22110 | 0.6092 | 0.0006 |
+
+These runs are intentionally tiny: 200 optimizer steps at `196,608` tokens per step is only `39,321,600` training tokens, about `0.022%` of the prepared `176.24B`-token corpus. Use them as smoke/fairness checks before scaling, not as final quality results.
+
 Compatibility comparison alias:
 
 ```bash

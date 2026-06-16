@@ -355,6 +355,17 @@ delta_rule [q,k,v,o]   HRM delta-rule memory adapter with q/k/v injection plus o
 rwkv7 [q,k,v,o]        RWKV-state memory comparison with q/k/v injection plus o residual
 ```
 
+Current 200-step result snapshot:
+
+| run | mode / heads / loss | final train loss | MMLU | invalid |
+| --- | --- | ---: | ---: | ---: |
+| HRM-Text-1B teacher | baseline | - | 0.6088 | 0.0005 |
+| original delta-Mem baseline | `delta_rule [q,k,v,o]`, CE | 0.22564 | 0.6089 | 0.0007 |
+| fair RWKV-state memory | `rwkv7 [q,k,v,o]`, CE | 0.22075 | 0.6075 | 0.0006 |
+| legacy RWKV q/o adapter | older q/o path | 0.22110 | 0.6092 | 0.0006 |
+
+Treat these as small-data continuation checks, not final model-quality claims. Each 200-step run sees only `39,321,600` training tokens, about `0.022%` of the prepared `176.24B`-token corpus.
+
 Compatibility comparison launcher:
 
 ```bash
@@ -363,7 +374,7 @@ bash scripts/run_delta_mem_recipe_vs_rwkv_mem_200.sh
 
 This is now an alias for the fair q/k/v/o CE-only comparison. The RWKV-state comparison is intentionally not parameter-matched with delta-Mem yet. It trains the RWKV7 reader plus projection heads, so it answers a different question: whether an RWKV recurrent state can act as a stronger memory adapter. A later fair-size comparison should reduce or freeze the RWKV reader.
 
-The run reads from the complete prepared `176.24B`-token corpus, but the 200-step experiment is only a `39.3M`-token continuation, not a full epoch over that corpus. This comparison uses HRM pretrain continuation and MMLU. It now supports the upstream TSW/QO/core settings, but it still does not reproduce the upstream Qasper/SFT episode objective unless we add an HRM chat/episode collator with write spans.
+The run reads from the complete prepared `176.24B`-token corpus, but the 200-step experiment is only a `39.3M`-token continuation, not a full epoch over that corpus. This is a very small dataset exposure for a 1B-parameter model. The comparison uses HRM pretrain continuation and MMLU, but it still does not reproduce the upstream Qasper/SFT episode objective unless we add an HRM chat/episode collator with write spans.
 
 For quick iteration:
 
